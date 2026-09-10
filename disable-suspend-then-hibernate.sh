@@ -188,6 +188,11 @@ remove_swapfile_and_subvolume() {
             log_success "Directory '${SWAP_DIR}' removed."
         fi
     fi
+
+    # Clean up SELinux file context definition for SWAP_DIR
+    if command -v semanage &>/dev/null; then
+        semanage fcontext -d "${SWAP_DIR}(/.*)?" 2>/dev/null || true
+    fi
 }
 
 restore_selinux_and_verify() {

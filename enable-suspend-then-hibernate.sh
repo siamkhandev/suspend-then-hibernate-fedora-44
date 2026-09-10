@@ -170,6 +170,16 @@ create_btrfs_swapfile() {
         chmod 0600 "${SWAP_FILE}"
     fi
 
+    # Set SELinux context to swapfile_t so systemd-logind is allowed to inspect it
+    if command -v semanage &>/dev/null; then
+        log_info "Registering SELinux file context for ${SWAP_DIR}..."
+        semanage fcontext -a -t swapfile_t "${SWAP_DIR}(/.*)?" 2>/dev/null || semanage fcontext -m -t swapfile_t "${SWAP_DIR}(/.*)?" 2>/dev/null || true
+    fi
+    chcon -t swapfile_t "${SWAP_FILE}" 2>/dev/null || true
+    if command -v restorecon &>/dev/null; then
+        restorecon -Rv "${SWAP_DIR}" 2>/dev/null || true
+    fi
+
     # Configure /etc/fstab with lower priority (pri=10) so fast zram (pri=100) handles daily RAM paging
     if ! grep -qs "${SWAP_FILE}" /etc/fstab; then
         log_info "Registering swapfile in /etc/fstab with priority 10..."
