@@ -1,0 +1,11 @@
+[Unit]
+Description=Suspend 30s after the screen is locked and idle
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/lock-sleep
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

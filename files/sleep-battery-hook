@@ -1,0 +1,31 @@
+#!/bin/bash
+# systemd sleep hook: record battery level before and after every sleep.
+# Installed to /usr/lib/systemd/system-sleep/; runs as root with $1=pre|post,
+# $2=suspend|hibernate|hybrid-sleep|suspend-then-hibernate.
+
+LOG=${SLEEP_BATTERY_LOG:-/var/log/sleep-battery.log}
+STATE=${SLEEP_BATTERY_STATE:-/run/sleep-battery.pre}
+BAT=/sys/class/power_supply/BAT0
+
+read_bat() {
+    echo "$(date +%s) $(cat $BAT/capacity) $(cat $BAT/energy_now)"
+}
+
+case $1 in
+    pre)
+        read_bat > "$STATE"
+        ;;
+    post)
+        [ -r "$STATE" ] || exit 0
+        read -r s_t s_pct s_uwh < "$STATE"
+        read -r e_t e_pct e_uwh < <(read_bat)
+        ac=$(cat /sys/class/power_supply/ADP1/online 2>/dev/null)
+        # SYSTEMD_SLEEP_ACTION says what actually happened for
+        # suspend-then-hibernate (suspend, hibernate, ...).
+        echo "start=$s_t end=$e_t mode=$2 action=${SYSTEMD_SLEEP_ACTION:-$2}" \
+             "pct_start=$s_pct pct_end=$e_pct uwh_start=$s_uwh uwh_end=$e_uwh ac=${ac:-0}" >> "$LOG"
+        chmod 644 "$LOG"
+        rm -f "$STATE"
+        ;;
+esac
+exit 0

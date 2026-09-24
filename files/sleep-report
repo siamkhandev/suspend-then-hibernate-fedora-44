@@ -1,0 +1,24 @@
+#!/bin/bash
+# Show battery drain for each recorded sleep. Usage: sleep-report [N]  (last N, default 20)
+
+LOG=${SLEEP_BATTERY_LOG:-/var/log/sleep-battery.log}
+[ -r "$LOG" ] || { echo "No sleeps recorded yet ($LOG missing)."; exit 0; }
+
+printf '%-16s  %-16s  %-9s  %-9s  %-10s  %-8s  %s\n' \
+    "Slept" "Woke" "Duration" "Type" "Battery" "Drain" "Avg power"
+tail -n "${1:-20}" "$LOG" | while read -r line; do
+    declare -A v=()
+    for kv in $line; do v[${kv%%=*}]=${kv#*=}; done
+    secs=$(( v[end] - v[start] ))
+    dur=$(printf '%dh %02dm' $((secs / 3600)) $((secs % 3600 / 60)))
+    type=${v[action]}; [ "$type" = suspend-then-hibernate ] && type=suspend
+    (( v[ac] )) && type="$type(AC)"
+    awk -v s="${v[uwh_start]}" -v e="${v[uwh_end]}" -v t="$secs" \
+        -v ps="${v[pct_start]}" -v pe="${v[pct_end]}" \
+        -v a="$(date -d @"${v[start]}" '+%m-%d %H:%M:%S')" \
+        -v b="$(date -d @"${v[end]}" '+%m-%d %H:%M:%S')" -v d="$dur" -v ty="$type" \
+        'BEGIN { wh = (s - e) / 1e6
+                 printf "%-16s  %-16s  %-9s  %-9s  %3d%% → %3d%%  %+5.1f%%  %s\n",
+                        a, b, d, ty, ps, pe, pe - ps,
+                        (t > 60 ? sprintf("%.2f W", wh * 3600 / t) : "-") }'
+done

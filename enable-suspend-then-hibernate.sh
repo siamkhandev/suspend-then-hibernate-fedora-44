@@ -14,6 +14,15 @@
 # 7. Non-disruptive SIGHUP reload of systemd-logind (avoids session drops)
 # 8. Automatic SELinux context restoration (restorecon)
 # 9. Sanitized output (redacted physical block offsets)
+#
+# Behaviour:
+# - HibernateMode=shutdown: hibernation fully powers off (no S4 residual drain)
+# - The GNOME Suspend button / `systemctl suspend` also suspend-then-hibernate
+# - lock-sleep (optional): on battery, sleep 30s after locking the screen
+# - Sleep battery report (optional): logs drain per sleep, notifies on unlock
+#
+# Usage: sudo bash enable-suspend-then-hibernate.sh [DELAY_MINUTES]
+#            [--no-lock-sleep] [--no-sleep-report]
 # ==============================================================================
 
 set -euo pipefail
@@ -28,8 +37,17 @@ LOGIND_CONF_DIR="/etc/systemd/logind.conf.d"
 LOGIND_CONF="${LOGIND_CONF_DIR}/suspend-then-hibernate.conf"
 GRUB_DEFAULT="/etc/default/grub"
 KERNEL_CMDLINE="/etc/kernel/cmdline"
+SUSPEND_OVERRIDE_DIR="/etc/systemd/system/systemd-suspend.service.d"
+SUSPEND_OVERRIDE="${SUSPEND_OVERRIDE_DIR}/suspend-then-hibernate.conf"
+SLEEP_HOOK="/usr/lib/systemd/system-sleep/sleep-battery"
+BIN_DIR="/usr/local/bin"
+USER_UNIT_DIR="/etc/systemd/user"
+FILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/files"
 DEFAULT_DELAY_MINUTES=120
 HIBERNATE_DELAY_MINUTES="${DEFAULT_DELAY_MINUTES}"
+DELAY_ARG=""
+INSTALL_LOCK_SLEEP=true
+INSTALL_SLEEP_REPORT=true
 
 # Colors for terminal output
 RED='\033[0;31m'
@@ -103,6 +121,28 @@ check_prerequisites() {
         fi
     done
     log_success "All required CLI tools are present."
+
+    # 5. Helper files shipped next to this script
+    if [ "${INSTALL_LOCK_SLEEP}" = true ] || [ "${INSTALL_SLEEP_REPORT}" = true ]; then
+        if [ ! -d "${FILES_DIR}" ]; then
+            log_error "Helper directory '${FILES_DIR}' not found. Run this script from a full checkout of the repository."
+            exit 1
+        fi
+    fi
+}
+
+parse_args() {
+    for arg in "$@"; do
+        case "${arg}" in
+            --no-lock-sleep)    INSTALL_LOCK_SLEEP=false ;;
+            --no-sleep-report)  INSTALL_SLEEP_REPORT=false ;;
+            -h|--help)
+                echo "Usage: sudo bash $0 [DELAY_MINUTES] [--no-lock-sleep] [--no-sleep-report]"
+                exit 0
+                ;;
+            *)                  DELAY_ARG="${arg}" ;;
+        esac
+    done
 }
 
 prompt_hibernate_delay() {
@@ -292,6 +332,8 @@ configure_systemd() {
     # - HibernateDelaySec: ${HIBERNATE_DELAY_MINUTES}min in suspend before hibernating
     # - HibernateOnACPower: no (stay in suspend when plugged in, only hibernate on battery)
     # - SuspendEstimationSec: 60min (measures battery drain rate via RTC alarm)
+    # - HibernateMode: shutdown (fully power off after writing the image; the
+    #   default "platform" S4 mode can keep USB/wake power on and drain ~0.7W)
     cat > "${SLEEP_CONF}" << INNER_EOF
 [Sleep]
 # Transition to hibernation after ${HIBERNATE_DELAY_MINUTES} minutes of suspend
@@ -302,6 +344,9 @@ HibernateOnACPower=no
 
 # RTC alarm measurement interval for battery drain estimation
 SuspendEstimationSec=60min
+
+# Power off completely once the hibernation image is written
+HibernateMode=shutdown
 INNER_EOF
     log_success "Created ${SLEEP_CONF} (${HIBERNATE_DELAY_MINUTES}min delay)."
 
@@ -318,10 +363,21 @@ HandleSuspendKey=suspend-then-hibernate
 INNER_EOF
     log_success "Created ${LOGIND_CONF}."
 
+    # GNOME's Suspend button (and `systemctl suspend`) call logind's Suspend(),
+    # which runs systemd-suspend.service and ignores the lid/key settings above.
+    # Point that service at suspend-then-hibernate too.
+    mkdir -p "${SUSPEND_OVERRIDE_DIR}"
+    cat > "${SUSPEND_OVERRIDE}" << 'INNER_EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/lib/systemd/systemd-sleep suspend-then-hibernate
+INNER_EOF
+    log_success "Created ${SUSPEND_OVERRIDE} (Suspend button now suspends-then-hibernates)."
+
     # Apply SELinux contexts to newly created configuration files and directories
     if command -v restorecon &>/dev/null; then
         log_info "Applying SELinux security contexts (restorecon)..."
-        restorecon -RF "${SLEEP_CONF_DIR}" "${LOGIND_CONF_DIR}" "/etc/dracut.conf.d" "${SWAP_DIR}" 2>/dev/null || true
+        restorecon -RF "${SLEEP_CONF_DIR}" "${LOGIND_CONF_DIR}" "${SUSPEND_OVERRIDE_DIR}" "/etc/dracut.conf.d" "${SWAP_DIR}" 2>/dev/null || true
         log_success "SELinux file contexts updated."
     fi
 
@@ -331,6 +387,51 @@ INNER_EOF
     systemctl daemon-reload
     systemctl kill --signal=HUP systemd-logind.service
     log_success "Systemd and logind reloaded cleanly without session disruption."
+}
+
+# Run a `systemctl --user` command in the invoking (sudo) user's session, if any.
+user_systemctl() {
+    local user="${SUDO_USER:-}" uid
+    [ -n "${user}" ] && [ "${user}" != "root" ] || return 0
+    uid=$(id -u "${user}")
+    [ -S "/run/user/${uid}/bus" ] || return 0
+    runuser -u "${user}" -- env XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        systemctl --user "$@" 2>/dev/null || true
+}
+
+install_user_service() {
+    local name="$1"
+    install -m 0755 "${FILES_DIR}/${name}" "${BIN_DIR}/${name}"
+    install -m 0644 "${FILES_DIR}/${name}.service" "${USER_UNIT_DIR}/${name}.service"
+    # Enable for every user's graphical session, then start it for the current one.
+    systemctl --global enable "${name}.service"
+    user_systemctl daemon-reload
+    user_systemctl restart "${name}.service"
+}
+
+install_extras() {
+    mkdir -p "${USER_UNIT_DIR}"
+
+    if [ "${INSTALL_LOCK_SLEEP}" = true ]; then
+        log_info "Installing lock-sleep (sleep 30s after locking, on battery only)..."
+        install_user_service lock-sleep
+        log_success "lock-sleep installed and enabled for all users."
+    fi
+
+    if [ "${INSTALL_SLEEP_REPORT}" = true ]; then
+        log_info "Installing sleep battery report (hook, unlock notification, sleep-report)..."
+        # systemd-sleep only runs hooks from /usr/lib/systemd/system-sleep/.
+        install -D -m 0755 "${FILES_DIR}/sleep-battery-hook" "${SLEEP_HOOK}"
+        install -m 0755 "${FILES_DIR}/sleep-report" "${BIN_DIR}/sleep-report"
+        install_user_service sleep-notify
+        log_success "Sleep battery report installed (log: /var/log/sleep-battery.log)."
+    fi
+
+    if command -v restorecon &>/dev/null; then
+        restorecon -F "${SLEEP_HOOK}" "${BIN_DIR}"/lock-sleep "${BIN_DIR}"/sleep-notify \
+            "${BIN_DIR}"/sleep-report "${USER_UNIT_DIR}"/*.service 2>/dev/null || true
+    fi
 }
 
 verify_status() {
@@ -347,6 +448,7 @@ verify_status() {
 
     echo "  • Active Sleep Operations: ${sleep_op}"
     echo "  • Lid Switch Action:       ${lid_switch}"
+    echo "  • Suspend Button Action:   $(systemctl show systemd-suspend.service -p ExecStart --value | grep -oE 'systemd-sleep [a-z-]+' | cut -d' ' -f2)"
 
     if [ -f "/etc/kernel/cmdline" ] && grep -qs "resume=" "/etc/kernel/cmdline"; then
         echo "  • Bootloader Resume Args:  Configured (UUID & offset set)"
@@ -371,7 +473,14 @@ verify_status() {
     echo "  2. On AC power, the machine remains in fast suspend (no unnecessary SSD writes)."
     echo "  3. When waking from hibernation, enter your LUKS passphrase at boot; your session will restore."
     echo "  4. Dual-Boot rule: Never boot into Windows while Linux is hibernated. Always resume Linux first."
-    echo "  5. To test immediately, run:"
+    if [ "${INSTALL_LOCK_SLEEP}" = true ]; then
+        echo "  5. On battery, locking the screen (Super+L) sleeps after 30s idle, and again if woken but left locked."
+    fi
+    if [ "${INSTALL_SLEEP_REPORT}" = true ]; then
+        echo "  6. After waking, unlocking shows a battery-drain notification; run 'sleep-report' for history."
+    fi
+    echo "  7. Lenovo tip: disable 'Always On USB' in BIOS to cut residual drain while hibernated."
+    echo "  8. To test immediately, run:"
     echo "       systemctl suspend-then-hibernate"
     echo ""
 }
@@ -380,12 +489,14 @@ main() {
     echo "=========================================================="
     echo "  Fedora 44 Windows-Level Auto-Hibernation Setup Script   "
     echo "=========================================================="
+    parse_args "$@"
     check_root
     check_prerequisites
-    prompt_hibernate_delay "${1:-}"
+    prompt_hibernate_delay "${DELAY_ARG}"
     create_btrfs_swapfile
     configure_kernel_and_dracut
     configure_systemd
+    install_extras
     verify_status
 }
 

@@ -13,6 +13,7 @@
 # 6. Non-disruptive SIGHUP reload of systemd-logind
 # 7. SELinux context restoration
 # 8. Post-rollback zram health verification
+# 9. Removes Suspend-button override, lock-sleep, and sleep battery report
 # ==============================================================================
 
 set -euo pipefail
@@ -27,6 +28,14 @@ LOGIND_CONF="${LOGIND_CONF_DIR}/suspend-then-hibernate.conf"
 GRUB_DEFAULT="/etc/default/grub"
 KERNEL_CMDLINE="/etc/kernel/cmdline"
 FSTAB="/etc/fstab"
+SUSPEND_OVERRIDE_DIR="/etc/systemd/system/systemd-suspend.service.d"
+SUSPEND_OVERRIDE="${SUSPEND_OVERRIDE_DIR}/suspend-then-hibernate.conf"
+SLEEP_HOOK="/usr/lib/systemd/system-sleep/sleep-battery"
+SLEEP_LOG="/var/log/sleep-battery.log"
+SLEEP_STATE="/run/sleep-battery.pre"
+BIN_DIR="/usr/local/bin"
+USER_UNIT_DIR="/etc/systemd/user"
+USER_SERVICES=(lock-sleep sleep-notify)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -127,11 +136,12 @@ revert_kernel_and_dracut() {
 revert_systemd_config() {
     log_info "Step 2: Removing systemd Suspend-then-Hibernate drop-in policies..."
 
-    rm -f "${SLEEP_CONF}" "${LOGIND_CONF}"
+    rm -f "${SLEEP_CONF}" "${LOGIND_CONF}" "${SUSPEND_OVERRIDE}"
 
     # Clean up directories if empty
     rmdir "${SLEEP_CONF_DIR}" 2>/dev/null || true
     rmdir "${LOGIND_CONF_DIR}" 2>/dev/null || true
+    rmdir "${SUSPEND_OVERRIDE_DIR}" 2>/dev/null || true
 
     log_info "Reloading systemd manager and signaling logind via SIGHUP..."
     systemctl daemon-reload
@@ -139,8 +149,41 @@ revert_systemd_config() {
     log_success "Systemd policies removed and logind reloaded cleanly."
 }
 
+# Run a `systemctl --user` command in the invoking (sudo) user's session, if any.
+user_systemctl() {
+    local user="${SUDO_USER:-}" uid
+    [ -n "${user}" ] && [ "${user}" != "root" ] || return 0
+    uid=$(id -u "${user}")
+    [ -S "/run/user/${uid}/bus" ] || return 0
+    runuser -u "${user}" -- env XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        systemctl --user "$@" 2>/dev/null || true
+}
+
+remove_extras() {
+    log_info "Step 3: Removing lock-sleep and sleep battery report..."
+
+    for name in "${USER_SERVICES[@]}"; do
+        if [ -f "${USER_UNIT_DIR}/${name}.service" ]; then
+            user_systemctl stop "${name}.service"
+            systemctl --global disable "${name}.service" 2>/dev/null || true
+            rm -f "${USER_UNIT_DIR}/${name}.service"
+        fi
+        rm -f "${BIN_DIR}/${name}"
+    done
+    user_systemctl daemon-reload
+
+    rm -f "${SLEEP_HOOK}" "${BIN_DIR}/sleep-report" "${SLEEP_LOG}" "${SLEEP_STATE}"
+
+    # Per-user notification bookmark
+    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+        rm -f "$(getent passwd "${SUDO_USER}" | cut -d: -f6)/.local/state/sleep-notify.last"
+    fi
+    log_success "Helper services, sleep hook, and sleep log removed."
+}
+
 remove_swapfile_and_subvolume() {
-    log_info "Step 3: Deactivating and removing swapfile and subvolume..."
+    log_info "Step 4: Deactivating and removing swapfile and subvolume..."
 
     # 1. Deactivate swap if active
     if [ -f "${SWAP_FILE}" ] && swapon --show | grep -qs "${SWAP_FILE}"; then
@@ -196,7 +239,7 @@ remove_swapfile_and_subvolume() {
 }
 
 restore_selinux_and_verify() {
-    log_info "Step 4: Restoring SELinux contexts and verifying system status..."
+    log_info "Step 5: Restoring SELinux contexts and verifying system status..."
 
     if command -v restorecon &>/dev/null; then
         restorecon -RF "${SLEEP_CONF_DIR}" "${LOGIND_CONF_DIR}" "/etc/dracut.conf.d" 2>/dev/null || true
@@ -234,6 +277,7 @@ main() {
     check_root
     revert_kernel_and_dracut
     revert_systemd_config
+    remove_extras
     remove_swapfile_and_subvolume
     restore_selinux_and_verify
 }

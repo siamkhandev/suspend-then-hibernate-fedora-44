@@ -1,0 +1,11 @@
+[Unit]
+Description=Notify battery drain after waking from sleep
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/sleep-notify
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

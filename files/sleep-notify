@@ -1,0 +1,55 @@
+#!/bin/bash
+# After unlocking, show a notification summarising battery drain for every
+# sleep since the last notification (data from the sleep-battery hook).
+
+LOG=${SLEEP_BATTERY_LOG:-/var/log/sleep-battery.log}
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/sleep-notify.last
+POLL=5
+
+mkdir -p "$(dirname "$STATE")"
+last=$(cat "$STATE" 2>/dev/null || echo 0)
+
+is_locked() {
+    gdbus call --session --dest org.gnome.ScreenSaver \
+        --object-path /org/gnome/ScreenSaver \
+        --method org.gnome.ScreenSaver.GetActive 2>/dev/null | grep -q true
+}
+
+fmt_dur() { printf '%dh %02dm' $(($1 / 3600)) $(($1 % 3600 / 60)); }
+
+while sleep "$POLL"; do
+    [ -r "$LOG" ] && ! is_locked || continue
+
+    # Aggregate all sleeps newer than the last one we reported.
+    read -r n first_start last_end asleep ps pe us ue hib ac < <(
+        awk -v last="$last" '
+            { delete v; for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] } }
+            v["end"] > last {
+                if (!n++) { fs = v["start"]; ps = v["pct_start"]; us = v["uwh_start"] }
+                le = v["end"]; pe = v["pct_end"]; ue = v["uwh_end"]
+                asleep += v["end"] - v["start"]
+                if (v["action"] ~ /hibernate/ && v["action"] !~ /failed/) hib = 1
+                if (v["ac"]) ac = 1
+            }
+            END { if (n) print n, fs, le, asleep, ps, pe, us, ue, hib + 0, ac + 0 }' "$LOG")
+    [ -n "$n" ] || continue
+
+    title="Woke from sleep"; (( hib )) && title="Woke from hibernation"
+    body=$(awk -v n="$n" -v ps="$ps" -v pe="$pe" -v us="$us" -v ue="$ue" -v t="$asleep" \
+               -v a="$(date -d @"$first_start" '+%a %H:%M')" \
+               -v b="$(date -d @"$last_end" '+%a %H:%M')" \
+               -v d="$(fmt_dur "$asleep")" -v ac="$ac" '
+        BEGIN {
+            wh = (us - ue) / 1e6
+            printf "Asleep %s (%s → %s)\n", d, a, b
+            printf "Battery %d%% → %d%% (%+d%%, %.1f Wh", ps, pe, pe - ps, -wh
+            if (t > 60) printf ", avg %.2f W", wh * 3600 / t
+            printf ")"
+            if (n > 1) printf "\n%d sleeps since last unlock", n
+            if (ac) printf "\nCharger was connected"
+        }')
+
+    notify-send --app-name="Sleep report" --icon=battery "$title" "$body"
+    last=$last_end
+    echo "$last" > "$STATE"
+done

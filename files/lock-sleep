@@ -1,0 +1,52 @@
+#!/bin/bash
+# On battery, suspend when the screen is locked and idle for DELAY seconds.
+# If woken while still locked (e.g. by an external keyboard/mouse) and left
+# untouched, it suspends again after DELAY seconds.
+
+DELAY=30   # seconds
+POLL=5     # seconds between checks
+
+is_locked() {
+    gdbus call --session --dest org.gnome.ScreenSaver \
+        --object-path /org/gnome/ScreenSaver \
+        --method org.gnome.ScreenSaver.GetActive 2>/dev/null | grep -q true
+}
+
+on_battery() {
+    # Any mains adapter online means we're on AC power.
+    ! grep -qx 1 /sys/class/power_supply/*/online 2>/dev/null
+}
+
+idle_ms() {
+    gdbus call --session --dest org.gnome.Mutter.IdleMonitor \
+        --object-path /org/gnome/Mutter/IdleMonitor/Core \
+        --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>/dev/null |
+        grep -oE '[0-9]+' | tail -1
+}
+
+# Wall-clock time of the last lock or resume; we wait DELAY seconds after it
+# so a wake without input (idle counter not reset) doesn't re-suspend instantly.
+armed_at=0
+prev=$(date +%s)
+
+while sleep "$POLL"; do
+    now=$(date +%s)
+    # A big jump in wall-clock time means the system was just asleep.
+    (( now - prev > POLL + 10 )) && armed_at=$now
+    prev=$now
+
+    if ! is_locked || ! on_battery; then
+        armed_at=0
+        continue
+    fi
+    (( armed_at == 0 )) && armed_at=$now
+
+    idle=$(idle_ms)
+    if (( now - armed_at >= DELAY && ${idle:-0} >= DELAY * 1000 )); then
+        systemctl suspend
+        # Give the suspend time to happen before checking again.
+        sleep 10
+        prev=$(date +%s)
+        armed_at=$prev
+    fi
+done
