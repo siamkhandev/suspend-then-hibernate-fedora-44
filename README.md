@@ -4,12 +4,22 @@ This project provides automated setup and rollback scripts for enabling Windows-
 
 ## How it Works
 1. **Sleep Phase (Fast Resume)**: When you close the lid or trigger sleep on battery, the laptop suspends to RAM immediately.
-2. **Timer / Battery Alarm**: The hardware RTC wakes the laptop after 120 minutes (or if the battery drains low), writes your RAM state into an encrypted 24GB Btrfs swapfile on the SSD, and powers off completely (`HibernateMode=shutdown`). The default ACPI S4 "platform" mode can keep USB/wake circuitry powered and was measured draining ~0.7 W (~1.7%/hour) while "hibernated".
+2. **Timer / Battery Alarm**: The hardware RTC wakes the laptop after 120 minutes (or if the battery drains low), writes your RAM state into an encrypted Btrfs swapfile on the SSD, and powers off completely (`HibernateMode=shutdown`). The default ACPI S4 "platform" mode can keep USB/wake circuitry powered and was measured draining ~0.7 W (~1.7%/hour) while "hibernated".
 3. **AC Power Bypass**: If plugged into the charger, the laptop stays suspended indefinitely (no unnecessary hibernation).
 4. **Suspend Button Too**: GNOME's *Suspend* menu item and `systemctl suspend` bypass logind's lid/key settings, so the script overrides `systemd-suspend.service` to suspend-then-hibernate as well.
 5. **Lock → Sleep (optional)**: On battery, locking the screen (Super+L) suspends after 30 seconds idle. If an external keyboard/mouse wakes it and nobody unlocks, it goes back to sleep after another 30 seconds. On AC power, locking never sleeps (downloads/builds keep running).
 6. **Sleep Battery Report (optional)**: A systemd sleep hook records battery level before/after every sleep. When you unlock after waking, a notification shows how long it slept, whether it hibernated, and how much battery it used. Run `sleep-report` for the full history.
-7. **Zero Performance Lag**: Fedora's default `zram0` (in-memory swap) remains at priority 100, while the SSD swapfile is set to priority 10. The SSD is only used for hibernation, never for normal daily multitasking.
+7. **Swap Sized to Your RAM**: The swapfile is sized automatically to installed RAM (rounded up) + 1GB, e.g. 16GB RAM → 17GB, 32GB RAM → 33GB. If an existing swapfile is too small (e.g. after a RAM upgrade), re-running the script recreates it and updates the resume offset in every boot entry. Override with `--swap-size=N`.
+8. **Zero Performance Lag**: Fedora's default `zram0` (in-memory swap) remains at priority 100, while the SSD swapfile is set to priority 10. The SSD is only used for hibernation, never for normal daily multitasking.
+
+---
+
+## Requirements
+- **Fedora 44 Workstation** (GNOME) with **Btrfs** root on **LUKS** encryption (Fedora's default encrypted install). The script refuses to run otherwise.
+- **Secure Boot disabled.** On Fedora, Secure Boot turns on kernel lockdown, which blocks hibernation. The script checks this and stops with a message if hibernation isn't allowed.
+- Free disk space for the swapfile (RAM + 1GB) plus 4GB headroom.
+- `lock-sleep` and the unlock notification use GNOME's lock-screen and idle APIs. On other desktops (KDE, etc.) they do nothing; install with `--no-lock-sleep --no-sleep-report`.
+- The sleep battery log needs a battery that reports energy (`energy_now`); on desktops or batteries that only report charge, it simply records nothing.
 
 ---
 
@@ -36,6 +46,11 @@ sudo bash enable-suspend-then-hibernate.sh
 Or pass the delay directly as an argument (e.g. 60 minutes, 90 minutes, 180 minutes):
 ```bash
 sudo bash enable-suspend-then-hibernate.sh 60
+```
+
+Set the swapfile size yourself (in GB) instead of sizing it to RAM:
+```bash
+sudo bash enable-suspend-then-hibernate.sh 30 --swap-size=40
 ```
 
 Skip the optional helpers with `--no-lock-sleep` and/or `--no-sleep-report`:

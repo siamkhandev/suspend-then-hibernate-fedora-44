@@ -20,16 +20,17 @@
 # - The GNOME Suspend button / `systemctl suspend` also suspend-then-hibernate
 # - lock-sleep (optional): on battery, sleep 30s after locking the screen
 # - Sleep battery report (optional): logs drain per sleep, notifies on unlock
+# - Swapfile sized to installed RAM + 1GB (recreated if an existing one is too small)
 #
 # Usage: sudo bash enable-suspend-then-hibernate.sh [DELAY_MINUTES]
-#            [--no-lock-sleep] [--no-sleep-report]
+#            [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report]
 # ==============================================================================
 
 set -euo pipefail
 
 SWAP_DIR="/swap"
 SWAP_FILE="${SWAP_DIR}/swapfile"
-SWAP_SIZE="24G"
+SWAP_GB=""   # computed from RAM in compute_swap_size, or set with --swap-size=N
 DRACUT_CONF="/etc/dracut.conf.d/resume.conf"
 SLEEP_CONF_DIR="/etc/systemd/sleep.conf.d"
 SLEEP_CONF="${SLEEP_CONF_DIR}/suspend-then-hibernate.conf"
@@ -104,16 +105,34 @@ check_prerequisites() {
     fi
     log_success "Underlying block storage verified: LUKS/dm-crypt encrypted."
 
-    # 3. Locale-independent free disk space check (requires >= 28GB for 24GB swapfile)
-    local avail_gb
-    avail_gb=$(LC_ALL=C df --output=avail -BG / 2>/dev/null | tail -n 1 | tr -dc '0-9')
-    if [ -z "${avail_gb}" ] || [ "${avail_gb}" -lt 28 ]; then
-        log_error "Insufficient disk space on /. Needed >= 28GB, available: ${avail_gb:-0}GB."
+    # 3. Kernel must allow hibernation. Secure Boot enables kernel lockdown on
+    #    Fedora, which removes "disk" from /sys/power/state.
+    if ! grep -qw disk /sys/power/state 2>/dev/null; then
+        log_error "The kernel does not allow hibernation on this system."
+        if grep -qE '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown 2>/dev/null; then
+            log_error "Kernel lockdown is active (usually because Secure Boot is enabled)."
+            log_error "Disable Secure Boot in the firmware setup, then run this script again."
+        fi
         exit 1
     fi
-    log_success "Disk space OK (${avail_gb}GB available on /)."
+    log_success "Kernel supports hibernation."
 
-    # 4. Check required system utilities
+    # 4. Locale-independent free disk space check (swapfile + 4GB headroom).
+    #    Space already held by an existing swapfile counts as available.
+    local avail_gb existing_gb=0 needed_gb
+    avail_gb=$(LC_ALL=C df --output=avail -BG / 2>/dev/null | tail -n 1 | tr -dc '0-9')
+    if [ -f "${SWAP_FILE}" ]; then
+        existing_gb=$(( $(stat -c %s "${SWAP_FILE}") / 1024 / 1024 / 1024 ))
+    fi
+    needed_gb=$(( SWAP_GB + 4 - existing_gb ))
+    (( needed_gb < 0 )) && needed_gb=0
+    if [ -z "${avail_gb}" ] || [ "${avail_gb}" -lt "${needed_gb}" ]; then
+        log_error "Insufficient disk space on /. Needed >= ${needed_gb}GB, available: ${avail_gb:-0}GB."
+        exit 1
+    fi
+    log_success "Disk space OK (${avail_gb}GB available on /, ${needed_gb}GB needed)."
+
+    # 5. Check required system utilities
     for tool in btrfs grubby dracut findmnt lsblk systemctl busctl; do
         if ! command -v "${tool}" &>/dev/null; then
             log_error "Required tool '${tool}' is not installed."
@@ -122,7 +141,7 @@ check_prerequisites() {
     done
     log_success "All required CLI tools are present."
 
-    # 5. Helper files shipped next to this script
+    # 6. Helper files shipped next to this script
     if [ "${INSTALL_LOCK_SLEEP}" = true ] || [ "${INSTALL_SLEEP_REPORT}" = true ]; then
         if [ ! -d "${FILES_DIR}" ]; then
             log_error "Helper directory '${FILES_DIR}' not found. Run this script from a full checkout of the repository."
@@ -131,13 +150,35 @@ check_prerequisites() {
     fi
 }
 
+compute_swap_size() {
+    # Hibernation writes RAM to swap, so size the swapfile to installed RAM
+    # (rounded up to the next GiB) plus 1GiB of headroom.
+    if [ -n "${SWAP_GB}" ]; then
+        log_info "Swapfile size set via --swap-size: ${SWAP_GB}GB."
+        return 0
+    fi
+    local mem_kb ram_gb
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    ram_gb=$(( (mem_kb + 1024 * 1024 - 1) / (1024 * 1024) ))
+    SWAP_GB=$(( ram_gb + 1 ))
+    log_info "Detected ${ram_gb}GB RAM; swapfile size: ${SWAP_GB}GB."
+}
+
 parse_args() {
     for arg in "$@"; do
         case "${arg}" in
             --no-lock-sleep)    INSTALL_LOCK_SLEEP=false ;;
             --no-sleep-report)  INSTALL_SLEEP_REPORT=false ;;
+            --swap-size=*)
+                SWAP_GB="${arg#--swap-size=}"
+                SWAP_GB="${SWAP_GB%[Gg]}"
+                if ! [[ "${SWAP_GB}" =~ ^[0-9]+$ ]] || [ "${SWAP_GB}" -lt 1 ]; then
+                    log_error "Invalid --swap-size '${arg#--swap-size=}'. Use whole GB, e.g. --swap-size=32."
+                    exit 1
+                fi
+                ;;
             -h|--help)
-                echo "Usage: sudo bash $0 [DELAY_MINUTES] [--no-lock-sleep] [--no-sleep-report]"
+                echo "Usage: sudo bash $0 [DELAY_MINUTES] [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report]"
                 exit 0
                 ;;
             *)                  DELAY_ARG="${arg}" ;;
@@ -200,15 +241,33 @@ create_btrfs_swapfile() {
         log_info "Subvolume '${SWAP_DIR}' already exists."
     fi
 
-    if [ ! -f "${SWAP_FILE}" ]; then
-        log_info "Creating ${SWAP_SIZE} swapfile at ${SWAP_FILE} (this may take 1-2 minutes)..."
-        btrfs filesystem mkswapfile -s "${SWAP_SIZE}" "${SWAP_FILE}"
-        chmod 0600 "${SWAP_FILE}"
-        log_success "Swapfile created with permissions 0600 (root only) and formatted."
-    else
-        log_info "Swapfile '${SWAP_FILE}' already exists, reusing."
-        chmod 0600 "${SWAP_FILE}"
+    # An existing swapfile smaller than RAM can't hold a hibernation image
+    # (e.g. after a RAM upgrade): recreate it. Its physical offset changes, which
+    # configure_kernel_and_dracut picks up by recomputing resume_offset.
+    if [ -f "${SWAP_FILE}" ]; then
+        local existing_gb
+        existing_gb=$(( $(stat -c %s "${SWAP_FILE}") / 1024 / 1024 / 1024 ))
+        if [ "${existing_gb}" -lt "${SWAP_GB}" ]; then
+            log_warn "Existing swapfile is ${existing_gb}GB, smaller than the ${SWAP_GB}GB needed. Recreating it..."
+            if swapon --show=NAME --noheadings | grep -qxF "${SWAP_FILE}"; then
+                if ! swapoff "${SWAP_FILE}"; then
+                    log_error "Could not deactivate ${SWAP_FILE} (not enough free RAM to move its pages?)."
+                    log_error "Close some applications or reboot, then run this script again."
+                    exit 1
+                fi
+            fi
+            rm -f "${SWAP_FILE}"
+        else
+            log_info "Swapfile '${SWAP_FILE}' already exists (${existing_gb}GB), reusing."
+        fi
     fi
+
+    if [ ! -f "${SWAP_FILE}" ]; then
+        log_info "Creating ${SWAP_GB}GB swapfile at ${SWAP_FILE} (this may take 1-2 minutes)..."
+        btrfs filesystem mkswapfile -s "${SWAP_GB}G" "${SWAP_FILE}"
+        log_success "Swapfile created and formatted."
+    fi
+    chmod 0600 "${SWAP_FILE}"
 
     # Set SELinux context to swapfile_t so systemd-logind is allowed to inspect it
     if command -v semanage &>/dev/null; then
@@ -242,19 +301,15 @@ create_btrfs_swapfile() {
     fi
 }
 
+# Strip any resume=/resume_offset= args from a file (in place).
+strip_resume_args() {
+    sed -i -E 's/[[:space:]]+resume=UUID=[^[:space:]"'"'"']+//g; s/[[:space:]]+resume_offset=[0-9]+//g' "$1"
+}
+
 configure_kernel_and_dracut() {
-    # Check if bootloader and dracut are already fully configured from a previous run
-    if [ -f "${DRACUT_CONF}" ] && \
-       grep -qs "resume=" "${KERNEL_CMDLINE}" 2>/dev/null && \
-       grep -qs "resume=" "${GRUB_DEFAULT}" 2>/dev/null; then
-        log_info "Kernel resume parameters and Dracut module are already configured."
-        log_info "Skipping bootloader and initramfs rebuild (fast path)."
-        return 0
-    fi
+    log_info "Checking kernel resume parameters and Dracut initramfs..."
 
-    log_info "Configuring kernel boot arguments and Dracut initramfs..."
-
-    local root_uuid resume_offset
+    local root_uuid resume_offset resume_args
     root_uuid=$(findmnt -no UUID /)
     resume_offset=$(btrfs inspect-internal map-swapfile -r "${SWAP_FILE}")
 
@@ -262,54 +317,67 @@ configure_kernel_and_dracut() {
         log_error "Failed to detect root UUID or swapfile resume offset."
         exit 1
     fi
+    resume_args="resume=UUID=${root_uuid} resume_offset=${resume_offset}"
     log_success "Root UUID and swapfile resume offset determined successfully."
 
-    # 1. Update kernel args via grubby for all installed BLS kernel entries
-    log_info "Applying kernel parameters across all installed kernels via grubby..."
-    grubby --update-kernel=ALL --args="resume=UUID=${root_uuid} resume_offset=${resume_offset}"
-    log_success "Kernel parameters applied via grubby."
-
-    # 2. Update /etc/default/grub (persists for any future grub2-mkconfig runs)
-    if [ -f "${GRUB_DEFAULT}" ]; then
-        if ! grep -qs "resume=" "${GRUB_DEFAULT}"; then
-            log_info "Updating ${GRUB_DEFAULT}..."
-            # Single bounded backup to prevent multiple backup file accumulation
-            if [ ! -f "${GRUB_DEFAULT}.bak" ]; then
-                cp -a "${GRUB_DEFAULT}" "${GRUB_DEFAULT}.bak"
-            fi
-
-            if grep -qE '^GRUB_CMDLINE_LINUX=".*"' "${GRUB_DEFAULT}"; then
-                sed -i -E "s|^GRUB_CMDLINE_LINUX=\"(.*)\"|GRUB_CMDLINE_LINUX=\"\1 resume=UUID=${root_uuid} resume_offset=${resume_offset}\"|" "${GRUB_DEFAULT}"
-            elif grep -qE "^GRUB_CMDLINE_LINUX='.*'" "${GRUB_DEFAULT}"; then
-                sed -i -E "s|^GRUB_CMDLINE_LINUX='(.*)'|GRUB_CMDLINE_LINUX='\1 resume=UUID=${root_uuid} resume_offset=${resume_offset}'|" "${GRUB_DEFAULT}"
-            else
-                log_error "Failed to match GRUB_CMDLINE_LINUX line format in ${GRUB_DEFAULT}."
-                log_error "Please manually append 'resume=UUID=${root_uuid} resume_offset=${resume_offset}' to ${GRUB_DEFAULT}."
-                exit 1
-            fi
-
-            # Fail loudly if sed did not match or apply
-            if ! grep -qs "resume=" "${GRUB_DEFAULT}"; then
-                log_error "Assertion failed: 'resume=' parameter was not written to ${GRUB_DEFAULT}."
-                exit 1
-            fi
-            log_success "${GRUB_DEFAULT} updated and verified."
-        fi
+    # 1. Kernel args for all installed BLS entries via grubby. Compare the exact
+    #    value: a recreated swapfile has a new offset, and a stale offset would
+    #    make resume silently fail.
+    local entry_args
+    entry_args=$(grubby --info=ALL 2>/dev/null | grep '^args=' || true)
+    if [ -z "${entry_args}" ] || grep -vqF "${resume_args}" <<< "${entry_args}"; then
+        log_info "Applying kernel parameters across all installed kernels via grubby..."
+        grubby --update-kernel=ALL --remove-args="resume resume_offset"
+        grubby --update-kernel=ALL --args="${resume_args}"
+        log_success "Kernel parameters applied via grubby."
+    else
+        log_info "Kernel entries already have the correct resume parameters."
     fi
 
-    # 3. Update /etc/kernel/cmdline if present (used by Fedora kernel-install for future kernels)
-    if [ -f "${KERNEL_CMDLINE}" ]; then
-        if ! grep -qs "resume=" "${KERNEL_CMDLINE}"; then
-            if [ ! -f "${KERNEL_CMDLINE}.bak" ]; then
-                cp -a "${KERNEL_CMDLINE}" "${KERNEL_CMDLINE}.bak"
-            fi
-            # Safely append parameters strictly once to the end of file (whole-file match via -z)
-            sed -i -z 's/[[:space:]]*$/ resume=UUID='"${root_uuid}"' resume_offset='"${resume_offset}"'\n/' "${KERNEL_CMDLINE}"
-            log_success "${KERNEL_CMDLINE} updated and verified."
+    # 2. /etc/default/grub (persists for any future grub2-mkconfig runs)
+    if [ -f "${GRUB_DEFAULT}" ] && ! grep -qF "${resume_args}" "${GRUB_DEFAULT}"; then
+        log_info "Updating ${GRUB_DEFAULT}..."
+        # Single bounded backup to prevent multiple backup file accumulation
+        if [ ! -f "${GRUB_DEFAULT}.bak" ]; then
+            cp -a "${GRUB_DEFAULT}" "${GRUB_DEFAULT}.bak"
         fi
+        strip_resume_args "${GRUB_DEFAULT}"
+
+        if grep -qE '^GRUB_CMDLINE_LINUX=".*"' "${GRUB_DEFAULT}"; then
+            sed -i -E "s|^GRUB_CMDLINE_LINUX=\"(.*)\"|GRUB_CMDLINE_LINUX=\"\1 ${resume_args}\"|" "${GRUB_DEFAULT}"
+        elif grep -qE "^GRUB_CMDLINE_LINUX='.*'" "${GRUB_DEFAULT}"; then
+            sed -i -E "s|^GRUB_CMDLINE_LINUX='(.*)'|GRUB_CMDLINE_LINUX='\1 ${resume_args}'|" "${GRUB_DEFAULT}"
+        else
+            log_error "Failed to match GRUB_CMDLINE_LINUX line format in ${GRUB_DEFAULT}."
+            log_error "Please manually append '${resume_args}' to ${GRUB_DEFAULT}."
+            exit 1
+        fi
+
+        # Fail loudly if sed did not match or apply
+        if ! grep -qF "${resume_args}" "${GRUB_DEFAULT}"; then
+            log_error "Assertion failed: resume parameters were not written to ${GRUB_DEFAULT}."
+            exit 1
+        fi
+        log_success "${GRUB_DEFAULT} updated and verified."
     fi
 
-    # 4. Add Dracut resume module configuration
+    # 3. /etc/kernel/cmdline if present (used by Fedora kernel-install for future kernels)
+    if [ -f "${KERNEL_CMDLINE}" ] && ! grep -qF "${resume_args}" "${KERNEL_CMDLINE}"; then
+        if [ ! -f "${KERNEL_CMDLINE}.bak" ]; then
+            cp -a "${KERNEL_CMDLINE}" "${KERNEL_CMDLINE}.bak"
+        fi
+        strip_resume_args "${KERNEL_CMDLINE}"
+        # Safely append parameters strictly once to the end of file (whole-file match via -z)
+        sed -i -z 's/[[:space:]]*$/ '"${resume_args}"'\n/' "${KERNEL_CMDLINE}"
+        log_success "${KERNEL_CMDLINE} updated and verified."
+    fi
+
+    # 4. Dracut resume module. The offset is read from the kernel cmdline at
+    #    boot, so the initramfs only needs rebuilding when the module is new.
+    if [ -f "${DRACUT_CONF}" ]; then
+        log_info "Dracut resume module already configured; skipping initramfs rebuild."
+        return 0
+    fi
     log_info "Configuring Dracut resume module in ${DRACUT_CONF}..."
     cat > "${DRACUT_CONF}" << 'INNER_EOF'
 add_dracutmodules+=" resume "
@@ -491,6 +559,7 @@ main() {
     echo "=========================================================="
     parse_args "$@"
     check_root
+    compute_swap_size
     check_prerequisites
     prompt_hibernate_delay "${DELAY_ARG}"
     create_btrfs_swapfile
