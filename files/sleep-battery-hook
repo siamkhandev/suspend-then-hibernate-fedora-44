@@ -6,14 +6,28 @@
 LOG=${SLEEP_BATTERY_LOG:-/var/log/sleep-battery.log}
 STATE=${SLEEP_BATTERY_STATE:-/run/sleep-battery.pre}
 # First battery, whatever it is called (BAT0, BAT1, CMB0, ...); none on desktops.
+# Some batteries (e.g. many Dells) report charge_now (uAh) instead of energy_now (uWh).
 BAT=
 for ps in /sys/class/power_supply/*; do
-    [ "$(cat "$ps/type" 2>/dev/null)" = Battery ] && [ -r "$ps/energy_now" ] && { BAT=$ps; break; }
+    [ "$(cat "$ps/type" 2>/dev/null)" = Battery ] || continue
+    if [ -r "$ps/energy_now" ] || { [ -r "$ps/charge_now" ] && [ -r "$ps/voltage_now" ]; }; then
+        BAT=$ps
+        break
+    fi
 done
 [ -n "$BAT" ] || exit 0
 
+# Remaining energy in uWh.
+energy_uwh() {
+    if [ -r "$BAT/energy_now" ]; then
+        cat "$BAT/energy_now"
+    else
+        echo $(( $(cat "$BAT/charge_now") * $(cat "$BAT/voltage_now") / 1000000 ))
+    fi
+}
+
 read_bat() {
-    echo "$(date +%s) $(cat $BAT/capacity) $(cat $BAT/energy_now)"
+    echo "$(date +%s) $(cat "$BAT/capacity") $(energy_uwh)"
 }
 
 case $1 in

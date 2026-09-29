@@ -19,7 +19,7 @@ This project provides automated setup and rollback scripts for enabling Windows-
 - **Secure Boot disabled.** On Fedora, Secure Boot turns on kernel lockdown, which blocks hibernation. The script checks this and stops with a message if hibernation isn't allowed.
 - Free disk space for the swapfile (RAM + 1GB) plus 4GB headroom.
 - **GNOME** for `lock-sleep` and the unlock notification (they use GNOME's lock-screen and idle APIs). The script detects the desktop and, on anything else (KDE, etc.), skips them automatically; suspend-then-hibernate itself works on any desktop.
-- The sleep battery log needs a battery that reports energy (`energy_now`); on desktops or batteries that only report charge, it simply records nothing.
+- The sleep battery log reads `energy_now`, or `charge_now` × `voltage_now` on batteries that only report charge (e.g. many Dells). On desktops without a battery it records nothing.
 
 ---
 
