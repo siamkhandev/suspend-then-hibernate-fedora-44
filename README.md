@@ -15,10 +15,10 @@ This project provides automated setup and rollback scripts for enabling Windows-
 ---
 
 ## Requirements
-- **Fedora 44 Workstation** (GNOME) with **Btrfs** root on **LUKS** encryption (Fedora's default encrypted install). The script refuses to run otherwise.
+- **Fedora** (tested on 44 Workstation) with **Btrfs** root on **LUKS** encryption (Fedora's default encrypted install). The script checks `/etc/os-release` and refuses to run on other distributions or on Fedora Atomic (Silverblue, Kinoite, ...), whose read-only `/usr` and rpm-ostree kernel args it can't configure. Other Fedora versions get a warning.
 - **Secure Boot disabled.** On Fedora, Secure Boot turns on kernel lockdown, which blocks hibernation. The script checks this and stops with a message if hibernation isn't allowed.
 - Free disk space for the swapfile (RAM + 1GB) plus 4GB headroom.
-- `lock-sleep` and the unlock notification use GNOME's lock-screen and idle APIs. On other desktops (KDE, etc.) they do nothing; install with `--no-lock-sleep --no-sleep-report`.
+- **GNOME** for `lock-sleep` and the unlock notification (they use GNOME's lock-screen and idle APIs). The script detects the desktop and, on anything else (KDE, etc.), skips them automatically; suspend-then-hibernate itself works on any desktop.
 - The sleep battery log needs a battery that reports energy (`energy_now`); on desktops or batteries that only report charge, it simply records nothing.
 
 ---

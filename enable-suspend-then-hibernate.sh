@@ -70,6 +70,60 @@ check_root() {
     fi
 }
 
+check_os_and_desktop() {
+    log_info "Checking distribution and desktop environment..."
+
+    # 1. Fedora only: relies on grubby, dracut, and Fedora's SELinux policy.
+    local os_id="" os_version="" os_variant="" os_name=""
+    if [ -r /etc/os-release ]; then
+        os_id=$(. /etc/os-release && echo "${ID:-}")
+        os_version=$(. /etc/os-release && echo "${VERSION_ID:-}")
+        os_variant=$(. /etc/os-release && echo "${VARIANT_ID:-}")
+        os_name=$(. /etc/os-release && echo "${PRETTY_NAME:-${NAME:-unknown}}")
+    fi
+    if [ "${os_id}" != "fedora" ]; then
+        log_error "This script supports Fedora only; detected '${os_name:-unknown}'."
+        exit 1
+    fi
+
+    # 2. Atomic desktops (Silverblue, Kinoite, ...) have a read-only /usr and
+    #    manage kernel args with rpm-ostree, so the setup below can't work.
+    if [ -e /run/ostree-booted ]; then
+        log_error "Fedora Atomic (${os_variant:-ostree}) is not supported: /usr is read-only and"
+        log_error "kernel arguments are managed by rpm-ostree."
+        exit 1
+    fi
+
+    if [ "${os_version}" != "44" ]; then
+        log_warn "Tested on Fedora 44; detected Fedora ${os_version:-unknown}. Continuing anyway."
+    else
+        log_success "Distribution: ${os_name}."
+    fi
+
+    # 3. GNOME is required only for lock-sleep and the unlock notification
+    #    (they use GNOME's ScreenSaver and Mutter idle D-Bus APIs).
+    #    sudo drops XDG_CURRENT_DESKTOP, so look for the user's gnome-shell.
+    local user="${SUDO_USER:-}" desktop="unknown"
+    if [ -n "${user}" ] && pgrep -u "${user}" -x gnome-shell &>/dev/null; then
+        desktop="GNOME"
+    elif [ -n "${user}" ] && pgrep -u "${user}" -x plasmashell &>/dev/null; then
+        desktop="KDE Plasma"
+    elif command -v gnome-shell &>/dev/null; then
+        desktop="GNOME (installed, no running session found)"
+    fi
+
+    if [[ "${desktop}" == GNOME* ]]; then
+        log_success "Desktop environment: ${desktop}."
+    elif [ "${INSTALL_LOCK_SLEEP}" = true ] || [ "${INSTALL_SLEEP_REPORT}" = true ]; then
+        log_warn "Desktop environment: ${desktop}. lock-sleep and the unlock notification need GNOME;"
+        log_warn "skipping them. Suspend-then-hibernate itself works on any desktop."
+        INSTALL_LOCK_SLEEP=false
+        INSTALL_SLEEP_REPORT=false
+    else
+        log_info "Desktop environment: ${desktop}."
+    fi
+}
+
 check_prerequisites() {
     log_info "Verifying system prerequisites and storage security..."
 
@@ -559,6 +613,7 @@ main() {
     echo "=========================================================="
     parse_args "$@"
     check_root
+    check_os_and_desktop
     compute_swap_size
     check_prerequisites
     prompt_hibernate_delay "${DELAY_ARG}"

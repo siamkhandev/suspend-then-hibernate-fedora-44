@@ -13,8 +13,9 @@ is_locked() {
 }
 
 on_battery() {
-    # Any mains adapter online means we're on AC power.
-    ! grep -qx 1 /sys/class/power_supply/*/online 2>/dev/null
+    # Needs a battery (desktops have none), and no mains adapter online.
+    grep -qx Battery /sys/class/power_supply/*/type 2>/dev/null &&
+        ! grep -qx 1 /sys/class/power_supply/*/online 2>/dev/null
 }
 
 idle_ms() {
