@@ -13,7 +13,7 @@
 # 6. Non-disruptive SIGHUP reload of systemd-logind
 # 7. SELinux context restoration
 # 8. Post-rollback zram health verification
-# 9. Removes Suspend-button override, lock-sleep, and sleep battery report
+# 9. Removes Suspend-button override, lock-sleep, sleep battery report, and usb-wake-guard
 # ==============================================================================
 
 set -euo pipefail
@@ -36,6 +36,7 @@ SLEEP_STATE="/run/sleep-battery.pre"
 BIN_DIR="/usr/local/bin"
 USER_UNIT_DIR="/etc/systemd/user"
 USER_SERVICES=(lock-sleep sleep-notify)
+USB_GUARD_UNIT="/etc/systemd/system/usb-wake-guard.service"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -172,6 +173,14 @@ remove_extras() {
         rm -f "${BIN_DIR}/${name}"
     done
     user_systemctl daemon-reload
+
+    if [ -f "${USB_GUARD_UNIT}" ]; then
+        # Stopping restores any USB wakeup settings it changed.
+        systemctl stop usb-wake-guard.service 2>/dev/null || true
+        systemctl disable usb-wake-guard.service 2>/dev/null || true
+        rm -f "${USB_GUARD_UNIT}" "${BIN_DIR}/usb-wake-guard" /run/usb-wake-guard.state
+        systemctl daemon-reload
+    fi
 
     rm -f "${SLEEP_HOOK}" "${BIN_DIR}/sleep-report" "${SLEEP_LOG}" "${SLEEP_STATE}"
 

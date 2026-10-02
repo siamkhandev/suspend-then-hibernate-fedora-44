@@ -18,12 +18,13 @@
 # Behaviour:
 # - HibernateMode=shutdown: hibernation fully powers off (no S4 residual drain)
 # - The GNOME Suspend button / `systemctl suspend` also suspend-then-hibernate
+# - usb-wake-guard (optional): external USB devices cannot wake the machine
 # - lock-sleep (optional): on battery, sleep 30s after locking the screen
 # - Sleep battery report (optional): logs drain per sleep, notifies on unlock
 # - Swapfile sized to installed RAM + 1GB (recreated if an existing one is too small)
 #
 # Usage: sudo bash enable-suspend-then-hibernate.sh [DELAY_MINUTES]
-#            [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report]
+#            [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report] [--no-usb-guard]
 # ==============================================================================
 
 set -euo pipefail
@@ -43,12 +44,14 @@ SUSPEND_OVERRIDE="${SUSPEND_OVERRIDE_DIR}/suspend-then-hibernate.conf"
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/sleep-battery"
 BIN_DIR="/usr/local/bin"
 USER_UNIT_DIR="/etc/systemd/user"
+SYSTEM_UNIT_DIR="/etc/systemd/system"
 FILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/files"
 DEFAULT_DELAY_MINUTES=120
 HIBERNATE_DELAY_MINUTES="${DEFAULT_DELAY_MINUTES}"
 DELAY_ARG=""
 INSTALL_LOCK_SLEEP=true
 INSTALL_SLEEP_REPORT=true
+INSTALL_USB_GUARD=true
 
 # Colors for terminal output
 RED='\033[0;31m'
@@ -223,6 +226,7 @@ parse_args() {
         case "${arg}" in
             --no-lock-sleep)    INSTALL_LOCK_SLEEP=false ;;
             --no-sleep-report)  INSTALL_SLEEP_REPORT=false ;;
+            --no-usb-guard)     INSTALL_USB_GUARD=false ;;
             --swap-size=*)
                 SWAP_GB="${arg#--swap-size=}"
                 SWAP_GB="${SWAP_GB%[Gg]}"
@@ -232,7 +236,7 @@ parse_args() {
                 fi
                 ;;
             -h|--help)
-                echo "Usage: sudo bash $0 [DELAY_MINUTES] [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report]"
+                echo "Usage: sudo bash $0 [DELAY_MINUTES] [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report] [--no-usb-guard]"
                 exit 0
                 ;;
             *)                  DELAY_ARG="${arg}" ;;
@@ -550,8 +554,17 @@ install_extras() {
         log_success "Sleep battery report installed (log: /var/log/sleep-battery.log)."
     fi
 
+    if [ "${INSTALL_USB_GUARD}" = true ]; then
+        log_info "Installing usb-wake-guard (USB devices and controllers can't wake from sleep)..."
+        install -m 0755 "${FILES_DIR}/usb-wake-guard" "${BIN_DIR}/usb-wake-guard"
+        install -m 0644 "${FILES_DIR}/usb-wake-guard.service" "${SYSTEM_UNIT_DIR}/usb-wake-guard.service"
+        systemctl daemon-reload
+        systemctl enable usb-wake-guard.service
+        log_success "usb-wake-guard installed; only the built-in keyboard, trackpad, power button and lid wake the machine."
+    fi
+
     if command -v restorecon &>/dev/null; then
-        restorecon -F "${SLEEP_HOOK}" "${BIN_DIR}"/lock-sleep "${BIN_DIR}"/sleep-notify \
+        restorecon -F "${SLEEP_HOOK}" "${BIN_DIR}"/usb-wake-guard "${SYSTEM_UNIT_DIR}"/usb-wake-guard.service "${BIN_DIR}"/lock-sleep "${BIN_DIR}"/sleep-notify \
             "${BIN_DIR}"/sleep-report "${USER_UNIT_DIR}"/*.service 2>/dev/null || true
     fi
 }
@@ -600,6 +613,9 @@ verify_status() {
     fi
     if [ "${INSTALL_SLEEP_REPORT}" = true ]; then
         echo "  6. After waking, unlocking shows a battery-drain notification; run 'sleep-report' for history."
+    fi
+    if [ "${INSTALL_USB_GUARD}" = true ]; then
+        echo "  7. USB devices and docks can't wake the machine; use the built-in keyboard, trackpad, power button or lid."
     fi
     echo "  7. Lenovo tip: disable 'Always On USB' in BIOS to cut residual drain while hibernated."
     echo "  8. To test immediately, run:"

@@ -1,0 +1,66 @@
+#!/bin/bash
+# Stop external USB devices from waking the machine out of sleep.
+# Usage: usb-wake-guard block|restore   (run as root by usb-wake-guard.service)
+#
+# block   - turn off wakeup for every USB device that is not built in, and for
+#           the USB controllers themselves (xHCI, Thunderbolt/USB4), and
+#           remember which ones were enabled.
+# restore - turn those back on after resume.
+#
+# Built-in devices (ACPI says "fixed": camera, Bluetooth radio, internal
+# USB keyboard) are left alone, but they cannot wake the machine either while
+# their controller is blocked. Non-USB inputs (PS/2 or I2C keyboard and
+# touchpad, power button, lid) are unaffected and still wake it.
+
+STATE=${USB_WAKE_GUARD_STATE:-/run/usb-wake-guard.state}
+USB_DEVICES=${USB_WAKE_GUARD_DEVICES:-/sys/bus/usb/devices}
+PCI_DEVICES=${USB_WAKE_GUARD_PCI:-/sys/bus/pci/devices}
+
+# Device entries only ("3-1.2"); skips root hubs ("usb3") and interfaces ("3-1.2:1.0").
+is_usb_device() { [[ $1 =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; }
+is_pci_addr()   { [[ $1 =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]; }
+
+case $1 in
+    block)
+        : > "$STATE"
+        for dev in "$USB_DEVICES"/*; do
+            name=${dev##*/}
+            is_usb_device "$name" || continue
+            [ "$(cat "$dev/removable" 2>/dev/null)" = fixed ] && continue
+            [ "$(cat "$dev/power/wakeup" 2>/dev/null)" = enabled ] || continue
+            if echo disabled > "$dev/power/wakeup" 2>/dev/null; then
+                echo "usb $name" >> "$STATE"
+                echo "usb-wake-guard: blocked wake from $name ($(cat "$dev/product" 2>/dev/null))"
+            fi
+        done
+        # PCI class 0x0c03xx = USB controllers (xHCI, USB4/Thunderbolt host).
+        for dev in "$PCI_DEVICES"/*; do
+            name=${dev##*/}
+            [[ $(cat "$dev/class" 2>/dev/null) == 0x0c03* ]] || continue
+            [ "$(cat "$dev/power/wakeup" 2>/dev/null)" = enabled ] || continue
+            if echo disabled > "$dev/power/wakeup" 2>/dev/null; then
+                echo "pci $name" >> "$STATE"
+                echo "usb-wake-guard: blocked wake from USB controller $name"
+            fi
+        done
+        ;;
+    restore)
+        [ -r "$STATE" ] || exit 0
+        while read -r kind name; do
+            case $kind in
+                usb) is_usb_device "$name" && path=$USB_DEVICES/$name/power/wakeup || continue ;;
+                pci) is_pci_addr "$name" && path=$PCI_DEVICES/$name/power/wakeup || continue ;;
+                *) continue ;;
+            esac
+            # The device may have been unplugged while asleep.
+            [ -w "$path" ] || continue
+            echo enabled > "$path"
+        done < "$STATE"
+        rm -f "$STATE"
+        ;;
+    *)
+        echo "Usage: $0 block|restore" >&2
+        exit 2
+        ;;
+esac
+exit 0
