@@ -1,5 +1,5 @@
 Name:           sk-slumber
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Sleep and hibernate manager with suspend-then-hibernate for Fedora
 
@@ -90,5 +90,10 @@ fi
 %{_datadir}/gnome-shell/extensions/slumber@sk/
 
 %changelog
+* Sat Oct 03 2026 Muhammad Siam <siamkhanb.work@gmail.com> - 0.1.1-1
+- Enable the Quick Settings extension automatically on first launch and show a
+  "log out and back in" banner when the Shell has not loaded it yet
+- Add Keep Awake / Allow Sleep / Hibernate Now actions to the app menu entry
+
 * Sat Oct 03 2026 Muhammad Siam <siamkhanb.work@gmail.com> - 0.1.0-1
 - Initial package

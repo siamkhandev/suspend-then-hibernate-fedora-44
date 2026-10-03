@@ -8,4 +8,17 @@ Icon=io.github.siamkhandev.Slumber
 Terminal=false
 StartupNotify=true
 Categories=Settings;HardwareSettings;GTK;
+Actions=KeepAwake;AllowSleep;HibernateNow;
 Keywords=hibernate;hibernation;sleep;suspend;standby;battery;save battery;power;lid;lock;windows sleep;modern standby;suspend-then-hibernate;
+
+[Desktop Action KeepAwake]
+Name=Keep Awake Until I Turn It Off
+Exec=slumber-ctl keep-awake forever
+
+[Desktop Action AllowSleep]
+Name=Allow Sleep Again
+Exec=slumber-ctl allow-sleep
+
+[Desktop Action HibernateNow]
+Name=Hibernate Now
+Exec=slumber-ctl hibernate

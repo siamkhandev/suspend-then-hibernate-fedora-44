@@ -21,7 +21,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "io.github.siamkhandev.Slumber"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 HERE = os.path.dirname(os.path.realpath(__file__))
 REFRESH_SECONDS = 10
 
@@ -35,6 +35,76 @@ def tool(name):
     if os.path.exists(sibling):
         return sibling
     return shutil.which(name) or f"/usr/bin/{name}"
+
+
+# --- GNOME Shell extension (Keep Awake tile) -------------------------------------
+# The Shell only discovers extensions at startup, so a freshly installed one
+# needs one log out/in. We make that the only manual step: enable it for the user
+# once, and say so when the running Shell hasn't loaded it yet.
+EXT_UUID = os.environ.get("SLUMBER_EXT_UUID", "slumber@sk")
+EXT_DIRS = ([os.environ["SLUMBER_EXT_DIR"]] if os.environ.get("SLUMBER_EXT_DIR") else
+            ["/usr/share/gnome-shell/extensions",
+             os.path.expanduser("~/.local/share/gnome-shell/extensions")])
+EXT_MARKER = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "slumber", "extension-enabled")
+
+
+def on_gnome():
+    return "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "")
+
+
+def extension_installed():
+    return any(os.path.isdir(os.path.join(d, EXT_UUID)) for d in EXT_DIRS)
+
+
+def ensure_extension_enabled():
+    """Add the extension to the user's enabled list, once (so turning it off sticks)."""
+    if os.path.exists(EXT_MARKER):
+        return
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None or source.lookup("org.gnome.shell", True) is None:
+        return
+    settings = Gio.Settings.new("org.gnome.shell")
+    current = settings.get_strv("enabled-extensions")
+    if EXT_UUID not in current:
+        settings.set_strv("enabled-extensions", current + [EXT_UUID])
+        Gio.Settings.sync()
+    try:
+        os.makedirs(os.path.dirname(EXT_MARKER), exist_ok=True)
+        open(EXT_MARKER, "w").close()
+    except OSError:
+        pass
+
+
+def shell_knows_extension(callback):
+    """callback(True/False), or None if the Shell can't be asked."""
+    def done(conn, res):
+        try:
+            info = conn.call_finish(res).unpack()[0]
+            callback(bool(info))
+        except GLib.Error:
+            callback(None)
+
+    try:
+        conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except GLib.Error:
+        callback(None)
+        return
+    conn.call("org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions",
+              "org.gnome.Shell.Extensions", "GetExtensionInfo",
+              GLib.Variant("(s)", (EXT_UUID,)), GLib.VariantType("(a{sv})"),
+              Gio.DBusCallFlags.NONE, 2000, None, done)
+
+
+def log_out():
+    try:
+        conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        conn.call("org.gnome.SessionManager", "/org/gnome/SessionManager",
+                  "org.gnome.SessionManager", "Logout", GLib.Variant("(u)", (0,)),
+                  None, Gio.DBusCallFlags.NONE, -1, None, None)
+    except GLib.Error:
+        pass
 
 
 STATUS = tool("slumber-status")
@@ -323,6 +393,12 @@ class SlumberWindow(Adw.ApplicationWindow):
                                        primary=True))
         view.add_top_bar(header)
 
+        self._banner = Adw.Banner(
+            title="Log out and back in to get the Keep Awake tile in Quick Settings",
+            button_label="Log Out")
+        self._banner.connect("button-clicked", lambda *_: log_out())
+        view.add_top_bar(self._banner)
+
         self._page = Adw.PreferencesPage()
 
         # Overall status + the one big action
@@ -377,6 +453,13 @@ class SlumberWindow(Adw.ApplicationWindow):
 
         GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
         self.refresh()
+        self._check_extension()
+
+    def _check_extension(self):
+        if not on_gnome() or not extension_installed():
+            return
+        ensure_extension_enabled()
+        shell_knows_extension(lambda known: self._banner.set_revealed(known is False))
 
     # -- data -----------------------------------------------------------
 
