@@ -1,0 +1,8 @@
+{
+  "uuid": "slumber@sk",
+  "name": "Slumber",
+  "description": "Quick Settings tile for Slumber: keep the laptop awake after locking, or hibernate right now.",
+  "shell-version": ["50"],
+  "session-modes": ["user"],
+  "url": "https://github.com/siamkhandev/suspend-then-hibernate-fedora-44"
+}

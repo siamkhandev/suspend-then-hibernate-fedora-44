@@ -12,10 +12,13 @@
 #
 # keep-awake is stored in $XDG_RUNTIME_DIR/slumber/keep-awake as an expiry
 # time (epoch seconds) or "forever", so it resets on logout/reboot. lock-sleep
-# reads it; it does not change lid or power-button behaviour.
+# reads it. It also holds a logind inhibitor lock (sleep + lid switch) in a
+# transient user unit, so closing the lid, the Suspend button and idle suspend
+# are blocked too. The unit stops itself when the timer ends.
 
 STATE_DIR=${SLUMBER_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/slumber}
 STATE=$STATE_DIR/keep-awake
+UNIT=slumber-keep-awake
 
 die() { echo "slumber-ctl: $*" >&2; exit 1; }
 
@@ -47,6 +50,25 @@ read_state() {
     fi
 }
 
+stop_inhibitor() {
+    systemctl --user stop "$UNIT.service" 2>/dev/null
+    systemctl --user reset-failed "$UNIT.service" 2>/dev/null
+    return 0
+}
+
+# $1 = seconds, or 0 for no limit. Failure is not fatal: lock-sleep still
+# honours the state file.
+start_inhibitor() {
+    local limit=()
+    stop_inhibitor
+    (( $1 > 0 )) && limit=(-p "RuntimeMaxSec=$1")
+    systemd-run --user --quiet --collect --unit="$UNIT" \
+        --description="Slumber: keep awake" "${limit[@]}" \
+        systemd-inhibit --what=sleep:handle-lid-switch --who=Slumber \
+        --why="Keep awake is on" --mode=block sleep infinity \
+        || echo "slumber-ctl: could not take the sleep inhibitor (only the lock timer is paused)" >&2
+}
+
 can_hibernate() {
     [[ $(busctl call org.freedesktop.login1 /org/freedesktop/login1 \
         org.freedesktop.login1.Manager CanHibernate 2>/dev/null) == 's "yes"' ]]
@@ -55,19 +77,27 @@ can_hibernate() {
 case ${1:-status} in
     keep-awake)
         arg=${2:-forever}
-        mkdir -p "$STATE_DIR"
-        if [[ $arg == forever ]]; then
-            echo forever > "$STATE"
-        else
+        secs=0
+        if [[ $arg != forever ]]; then
             secs=$(parse_duration "$arg") || die "invalid duration '$arg' (use e.g. 30m, 2h, 1h30m or forever)"
-            echo $(( $(date +%s) + secs )) > "$STATE"
         fi
+        mkdir -p "$STATE_DIR"
+        if (( secs )); then
+            echo $(( $(date +%s) + secs )) > "$STATE"
+        else
+            echo forever > "$STATE"
+        fi
+        [[ ${SLUMBER_INHIBIT:-1} == 0 ]] || start_inhibitor "$secs"
         ;;
     allow-sleep)
         rm -f "$STATE"
+        stop_inhibitor
         ;;
     hibernate)
         can_hibernate || die "hibernation is not available (run 'sudo slumber-setup enable' first)"
+        # An explicit hibernate overrides keep-awake (its lock would block it).
+        rm -f "$STATE"
+        stop_inhibitor
         exec systemctl hibernate
         ;;
     keeping-awake)

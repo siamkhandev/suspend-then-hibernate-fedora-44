@@ -28,9 +28,10 @@ This project provides automated setup and rollback scripts for enabling Windows-
 
 - `bin/slumber-setup`: `enable` creates the swapfile, configures resume offsets, updates dracut/grub and sets systemd sleep rules; `disable` completely reverts it and returns the system to default Fedora settings; `status` prints the current state.
 - `bin/slumber-status`: reports the current state as text or JSON (`--json`). Needs no root; the GUI reads this.
-- `bin/slumber-ctl`: everyday controls, no root: `keep-awake [30m|2h|forever]` stops `lock-sleep` sleeping after a lock (so a long task keeps running), `allow-sleep` undoes it, `hibernate` hibernates immediately, `status [--json]` shows the mode. Keep-awake resets at logout/reboot and doesn't change lid or power-button behaviour.
+- `bin/slumber-ctl`: everyday controls, no root: `keep-awake [30m|2h|forever]` stops `lock-sleep` sleeping after a lock (so a long task keeps running), `allow-sleep` undoes it, `hibernate` hibernates immediately, `status [--json]` shows the mode. While keep-awake is on it also holds a logind inhibitor lock, so closing the lid, the Suspend button and idle suspend are blocked too. It resets at logout/reboot, and `hibernate` overrides it.
 - `bin/` helpers: `lock-sleep`, `sleep-notify`, `sleep-report`, `usb-wake-guard`.
 - `data/`: systemd units (`systemd/system`, `systemd/user`) and the sleep hook (`system-sleep/sleep-battery`, logs to `/var/log/sleep-battery.log`).
+- `data/gnome-shell/extensions/slumber@sk/`: GNOME Shell extension (Shell 50) that adds a **Keep Awake** tile to the Quick Settings panel: click to toggle, arrow for 30m/1h/2h/4h/until-off, plus **Hibernate now**. It is a front end over `slumber-ctl`. After installing, log out and in once, then run `gnome-extensions enable slumber@sk`.
 - `Makefile`: `sudo make install` copies everything to `/usr` (use `DESTDIR`/`PREFIX` when packaging).
 
 The helpers are only installed by `make install` (or the package); `slumber-setup enable` switches them on or off. What is enabled is recorded in `/etc/slumber/slumber.conf`, and the sleep hook stays inactive until the sleep report is enabled there.

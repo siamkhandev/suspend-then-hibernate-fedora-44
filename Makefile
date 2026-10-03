@@ -3,6 +3,7 @@
 PREFIX  ?= /usr
 BINDIR  ?= $(PREFIX)/bin
 UNITDIR ?= $(PREFIX)/lib/systemd
+EXTDIR  ?= $(PREFIX)/share/gnome-shell/extensions/slumber@sk
 DESTDIR ?=
 
 BINS := slumber-setup slumber-status slumber-ctl lock-sleep sleep-notify sleep-report usb-wake-guard
@@ -20,12 +21,15 @@ install:
 		sed 's|/usr/bin|$(BINDIR)|g' $$u > $(DESTDIR)$(UNITDIR)/user/$$(basename $$u); \
 		chmod 0644 $(DESTDIR)$(UNITDIR)/user/$$(basename $$u); done
 	install -m 0755 data/system-sleep/sleep-battery $(DESTDIR)$(UNITDIR)/system-sleep/sleep-battery
+	install -d $(DESTDIR)$(EXTDIR)
+	install -m 0644 data/gnome-shell/extensions/slumber@sk/*.js* $(DESTDIR)$(EXTDIR)/
 
 uninstall:
 	for b in $(BINS); do rm -f $(DESTDIR)$(BINDIR)/$$b; done
 	rm -f $(DESTDIR)$(UNITDIR)/system/usb-wake-guard.service \
 		$(DESTDIR)$(UNITDIR)/user/lock-sleep.service $(DESTDIR)$(UNITDIR)/user/sleep-notify.service \
 		$(DESTDIR)$(UNITDIR)/system-sleep/sleep-battery
+	rm -rf $(DESTDIR)$(EXTDIR)
 
 check:
 	for b in slumber-setup slumber-ctl lock-sleep sleep-notify sleep-report usb-wake-guard; do bash -n bin/$$b; done
