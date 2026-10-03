@@ -1,0 +1,5 @@
+# gtk4 and libadwaita are needed for their GObject Introspection typelibs (used
+# from Python), not as linked libraries.
+addFilter("explicit-lib-dependency")
+# Names the tools use as plain English words.
+addFilter("spelling-error")

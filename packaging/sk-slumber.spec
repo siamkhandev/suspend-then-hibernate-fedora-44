@@ -18,8 +18,10 @@ BuildRequires:  appstream
 
 # The app
 Requires:       python3-gobject
-Requires:       typelib(Gtk) = 4.0
-Requires:       typelib(Adw) = 1
+# Python imports these through GObject Introspection typelibs, which Fedora
+# does not expose as provides, so depend on the packages that ship them.
+Requires:       gtk4
+Requires:       libadwaita
 Requires:       polkit
 # slumber-setup: swapfile, resume offset, boot configuration
 Requires:       btrfs-progs
