@@ -52,3 +52,17 @@ check:
 	desktop-file-validate data/applications/*.desktop
 	PYTHONDONTWRITEBYTECODE=1 python3 -c "import ast; ast.parse(open('bin/slumber').read())"
 	PYTHONDONTWRITEBYTECODE=1 python3 -c "import ast,sys; ast.parse(open('bin/slumber-status').read())"
+
+# --- packaging -----------------------------------------------------------------
+NAME    := sk-slumber
+VERSION := $(shell sed -n 's/^Version:[[:space:]]*//p' packaging/$(NAME).spec)
+
+.PHONY: dist srpm rpm
+dist:
+	git archive --format=tar.gz --prefix=$(NAME)-$(VERSION)/ -o $(NAME)-$(VERSION).tar.gz HEAD
+
+srpm: dist
+	rpmbuild -bs packaging/$(NAME).spec --define "_sourcedir $(CURDIR)" --define "_srcrpmdir $(CURDIR)"
+
+rpm: dist
+	rpmbuild -bb packaging/$(NAME).spec --define "_sourcedir $(CURDIR)" --define "_rpmdir $(CURDIR)"
