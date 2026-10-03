@@ -21,7 +21,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "io.github.siamkhandev.Slumber"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 HERE = os.path.dirname(os.path.realpath(__file__))
 REFRESH_SECONDS = 10
 

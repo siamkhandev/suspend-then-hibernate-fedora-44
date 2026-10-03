@@ -71,9 +71,13 @@ start_inhibitor() {
         || echo "slumber-ctl: could not take the sleep inhibitor (only the lock timer is paused)" >&2
 }
 
+# logind answers "challenge" instead of "yes" while a blocking inhibitor is held,
+# and keep-awake holds one. That is not "unavailable"; only "na"/"no" are.
 can_hibernate() {
-    [[ $(busctl call org.freedesktop.login1 /org/freedesktop/login1 \
-        org.freedesktop.login1.Manager CanHibernate 2>/dev/null) == 's "yes"' ]]
+    local answer
+    answer=$(busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager CanHibernate 2>/dev/null)
+    [[ $answer == 's "yes"' || $answer == 's "challenge"' ]]
 }
 
 case ${1:-status} in
