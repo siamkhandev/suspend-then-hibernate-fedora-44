@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Muhammad Siam
 # Day-to-day controls for Slumber. Needs no root; the top-bar tile and the app
 # call this.
 #

@@ -1,4 +1,6 @@
 #!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Muhammad Siam
 """Slumber: status and setup for suspend-then-hibernate (GTK4 + libadwaita).
 
 The app is a front end. It reads state from `slumber-status --json` and

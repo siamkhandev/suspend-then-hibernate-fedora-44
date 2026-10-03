@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Muhammad Siam
+
 // Quick Settings tile for Slumber. A thin front end over `slumber-ctl`:
 // toggling the tile runs `slumber-ctl keep-awake` / `allow-sleep`, and the
 // state is read straight from the file slumber-ctl keeps in $XDG_RUNTIME_DIR.

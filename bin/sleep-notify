@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Muhammad Siam
 # After unlocking, show a notification summarising battery drain for every
 # sleep since the last notification (data from the sleep-battery hook).
 

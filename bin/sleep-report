@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Muhammad Siam
 # Show battery drain for each recorded sleep. Usage: sleep-report [N]  (last N, default 20)
 
 LOG=${SLEEP_BATTERY_LOG:-/var/log/sleep-battery.log}

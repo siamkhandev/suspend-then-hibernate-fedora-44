@@ -122,3 +122,9 @@ sudo dnf install sk-slumber
 ```
 
 Installing changes nothing on the system until you enable it from the Slumber app or with `sudo slumber-setup enable`.
+
+---
+
+## License
+
+Slumber is free software, licensed under the **GNU General Public License v3.0 or later** (`GPL-3.0-or-later`). See [`LICENSE`](LICENSE). Copyright (C) 2026 Muhammad Siam.

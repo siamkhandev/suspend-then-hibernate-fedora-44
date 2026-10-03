@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Muhammad Siam
 # Stop external USB devices from waking the machine out of sleep.
 # Usage: usb-wake-guard block|restore   (run as root by usb-wake-guard.service)
 #

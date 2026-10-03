@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Muhammad Siam
+
 # Install Slumber's programs and unit files. Packaging uses DESTDIR/PREFIX:
 #   make install DESTDIR=%{buildroot} PREFIX=/usr
 PREFIX  ?= /usr

@@ -3,9 +3,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Sleep and hibernate manager with suspend-then-hibernate for Fedora
 
-# TODO: the project has no LICENSE file yet. Pick a license, add it to the
-# repository and put its SPDX identifier here before publishing.
-License:        TODO-choose-a-license
+License:        GPL-3.0-or-later
 URL:            https://github.com/siamkhandev/suspend-then-hibernate-fedora-44
 Source0:        %{name}-%{version}.tar.gz
 
@@ -72,6 +70,7 @@ fi
 :
 
 %files
+%license LICENSE
 %{_bindir}/slumber
 %{_bindir}/slumber-ctl
 %{_bindir}/slumber-setup

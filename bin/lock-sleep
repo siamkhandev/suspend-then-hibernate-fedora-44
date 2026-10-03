@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Muhammad Siam
 # On battery, suspend when the screen is locked and idle for DELAY seconds.
 # If woken while still locked (e.g. by an external keyboard/mouse) and left
 # untouched, it suspends again after DELAY seconds.

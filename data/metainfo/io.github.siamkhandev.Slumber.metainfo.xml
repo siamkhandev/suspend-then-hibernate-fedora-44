@@ -2,6 +2,7 @@
 <component type="desktop-application">
   <id>io.github.siamkhandev.Slumber</id>
   <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
   <name>Slumber</name>
   <summary>Sleep and hibernate manager: save battery while your laptop sleeps</summary>
   <description>
