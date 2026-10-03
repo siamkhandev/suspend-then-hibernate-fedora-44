@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Slumber
+GenericName=Sleep & Hibernate Manager
+Comment=Save battery in sleep with suspend-then-hibernate, like Windows Modern Sleep
+Exec=slumber
+Icon=io.github.siamkhandev.Slumber
+Terminal=false
+StartupNotify=true
+Categories=Settings;HardwareSettings;GTK;
+Keywords=hibernate;hibernation;sleep;suspend;standby;battery;save battery;power;lid;lock;windows sleep;modern standby;suspend-then-hibernate;

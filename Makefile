@@ -3,10 +3,11 @@
 PREFIX  ?= /usr
 BINDIR  ?= $(PREFIX)/bin
 UNITDIR ?= $(PREFIX)/lib/systemd
-EXTDIR  ?= $(PREFIX)/share/gnome-shell/extensions/slumber@sk
+DATADIR ?= $(PREFIX)/share
+EXTDIR  ?= $(DATADIR)/gnome-shell/extensions/slumber@sk
 DESTDIR ?=
 
-BINS := slumber-setup slumber-status slumber-ctl lock-sleep sleep-notify sleep-report usb-wake-guard
+BINS := slumber slumber-setup slumber-status slumber-ctl lock-sleep sleep-notify sleep-report usb-wake-guard
 
 .PHONY: install uninstall check
 
@@ -21,6 +22,16 @@ install:
 		sed 's|/usr/bin|$(BINDIR)|g' $$u > $(DESTDIR)$(UNITDIR)/user/$$(basename $$u); \
 		chmod 0644 $(DESTDIR)$(UNITDIR)/user/$$(basename $$u); done
 	install -m 0755 data/system-sleep/sleep-battery $(DESTDIR)$(UNITDIR)/system-sleep/sleep-battery
+	install -D -m 0644 data/applications/io.github.siamkhandev.Slumber.desktop \
+		$(DESTDIR)$(DATADIR)/applications/io.github.siamkhandev.Slumber.desktop
+	install -D -m 0644 data/metainfo/io.github.siamkhandev.Slumber.metainfo.xml \
+		$(DESTDIR)$(DATADIR)/metainfo/io.github.siamkhandev.Slumber.metainfo.xml
+	install -D -m 0644 data/icons/hicolor/scalable/apps/io.github.siamkhandev.Slumber.svg \
+		$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/io.github.siamkhandev.Slumber.svg
+	install -d $(DESTDIR)$(DATADIR)/polkit-1/actions
+	sed 's|/usr/bin|$(BINDIR)|g' data/polkit/io.github.siamkhandev.slumber.policy \
+		> $(DESTDIR)$(DATADIR)/polkit-1/actions/io.github.siamkhandev.slumber.policy
+	chmod 0644 $(DESTDIR)$(DATADIR)/polkit-1/actions/io.github.siamkhandev.slumber.policy
 	install -d $(DESTDIR)$(EXTDIR)
 	install -m 0644 data/gnome-shell/extensions/slumber@sk/*.js* $(DESTDIR)$(EXTDIR)/
 
@@ -30,8 +41,14 @@ uninstall:
 		$(DESTDIR)$(UNITDIR)/user/lock-sleep.service $(DESTDIR)$(UNITDIR)/user/sleep-notify.service \
 		$(DESTDIR)$(UNITDIR)/system-sleep/sleep-battery
 	rm -rf $(DESTDIR)$(EXTDIR)
+	rm -f $(DESTDIR)$(DATADIR)/applications/io.github.siamkhandev.Slumber.desktop \
+		$(DESTDIR)$(DATADIR)/metainfo/io.github.siamkhandev.Slumber.metainfo.xml \
+		$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/io.github.siamkhandev.Slumber.svg \
+		$(DESTDIR)$(DATADIR)/polkit-1/actions/io.github.siamkhandev.slumber.policy
 
 check:
 	for b in slumber-setup slumber-ctl lock-sleep sleep-notify sleep-report usb-wake-guard; do bash -n bin/$$b; done
 	bash -n data/system-sleep/sleep-battery
+	desktop-file-validate data/applications/*.desktop
+	PYTHONDONTWRITEBYTECODE=1 python3 -c "import ast; ast.parse(open('bin/slumber').read())"
 	PYTHONDONTWRITEBYTECODE=1 python3 -c "import ast,sys; ast.parse(open('bin/slumber-status').read())"

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.siamkhandev.Slumber</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>Slumber</name>
+  <summary>Sleep and hibernate manager: save battery while your laptop sleeps</summary>
+  <description>
+    <p>
+      Slumber gives your Fedora laptop Windows-style sleep. It suspends instantly when you close the
+      lid, then after a delay you choose it wakes briefly, saves everything to an encrypted swapfile
+      and powers off completely, so a laptop left asleep overnight does not drain its battery.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>See hibernation status, swapfile, battery and the battery used by each sleep</li>
+      <li>Turn suspend-then-hibernate on or off from a simple form, with administrator approval</li>
+      <li>Keep the laptop awake after locking while a long task finishes, or hibernate right now</li>
+      <li>Optional: sleep shortly after locking, and stop USB devices from waking the laptop</li>
+      <li>A Keep Awake tile in the GNOME Quick Settings panel</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.siamkhandev.Slumber.desktop</launchable>
+  <developer id="io.github.siamkhandev"><name>Muhammad Siam</name></developer>
+  <url type="homepage">https://github.com/siamkhandev/suspend-then-hibernate-fedora-44</url>
+  <url type="bugtracker">https://github.com/siamkhandev/suspend-then-hibernate-fedora-44/issues</url>
+  <provides>
+    <binary>slumber</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>Settings</category>
+  </categories>
+  <keywords>
+    <keyword>hibernate</keyword>
+    <keyword>sleep</keyword>
+    <keyword>suspend</keyword>
+    <keyword>battery</keyword>
+    <keyword>power</keyword>
+    <keyword>standby</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+</component>

@@ -219,6 +219,10 @@ def collect(sleeps):
         "swap": swap,
         "resume": {
             "kernel_args_present": bool(resume and offset),
+            # The running kernel only has them after a reboot, but hibernating
+            # works as soon as the boot config has them.
+            "boot_config": bool(resume and offset) or any(
+                "resume=" in (read(f) or "") for f in ("/etc/kernel/cmdline", "/etc/default/grub")),
             "dracut_module": os.path.exists(DRACUT_CONF),
         },
         "system": {

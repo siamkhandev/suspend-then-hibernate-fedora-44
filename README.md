@@ -27,10 +27,12 @@ This project provides automated setup and rollback scripts for enabling Windows-
 ## Files
 
 - `bin/slumber-setup`: `enable` creates the swapfile, configures resume offsets, updates dracut/grub and sets systemd sleep rules; `disable` completely reverts it and returns the system to default Fedora settings; `status` prints the current state.
+- `bin/slumber`: the **Slumber** app (GTK4 + libadwaita). Shows status, battery and recent sleeps; has Keep Awake and Hibernate now controls; a form to enable or change suspend-then-hibernate (delay, swap size, extras) that applies it through polkit (`pkexec slumber-setup`), with live output; and Remove Setup. Set `SLUMBER_DRY_RUN=1` to try the flow without changing anything.
+- `data/`: also holds the polkit policy (`polkit/`), desktop entry, AppStream metadata and icon.
 - `bin/slumber-status`: reports the current state as text or JSON (`--json`). Needs no root; the GUI reads this.
 - `bin/slumber-ctl`: everyday controls, no root: `keep-awake [30m|2h|forever]` stops `lock-sleep` sleeping after a lock (so a long task keeps running), `allow-sleep` undoes it, `hibernate` hibernates immediately, `status [--json]` shows the mode. While keep-awake is on it also holds a logind inhibitor lock, so closing the lid, the Suspend button and idle suspend are blocked too. It resets at logout/reboot, and `hibernate` overrides it.
 - `bin/` helpers: `lock-sleep`, `sleep-notify`, `sleep-report`, `usb-wake-guard`.
-- `data/`: systemd units (`systemd/system`, `systemd/user`) and the sleep hook (`system-sleep/sleep-battery`, logs to `/var/log/sleep-battery.log`).
+- `data/` (continued): systemd units (`systemd/system`, `systemd/user`) and the sleep hook (`system-sleep/sleep-battery`, logs to `/var/log/sleep-battery.log`).
 - `data/gnome-shell/extensions/slumber@sk/`: GNOME Shell extension (Shell 50) that adds a **Keep Awake** tile to the Quick Settings panel: click to toggle, arrow for 30m/1h/2h/4h/until-off, plus **Hibernate now**. It is a front end over `slumber-ctl`. After installing, log out and in once, then run `gnome-extensions enable slumber@sk`.
 - `Makefile`: `sudo make install` copies everything to `/usr` (use `DESTDIR`/`PREFIX` when packaging).
 

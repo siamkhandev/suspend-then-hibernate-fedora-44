@@ -1,0 +1,620 @@
+#!/usr/bin/python3
+"""Slumber: status and setup for suspend-then-hibernate (GTK4 + libadwaita).
+
+The app is a front end. It reads state from `slumber-status --json` and
+`slumber-ctl status --json`, runs everyday actions through `slumber-ctl`, and
+applies setup changes with `pkexec slumber-setup` (polkit asks for approval).
+"""
+import json
+import os
+import shlex
+import shutil
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.siamkhandev.Slumber"
+VERSION = "0.1.0"
+HERE = os.path.dirname(os.path.realpath(__file__))
+REFRESH_SECONDS = 10
+
+DURATIONS = [("30 minutes", "30m"), ("1 hour", "1h"), ("2 hours", "2h"),
+             ("4 hours", "4h"), ("Until I turn it off", "forever")]
+
+
+def tool(name):
+    """Prefer the copy next to this script (source checkout), else PATH, else /usr/bin."""
+    sibling = os.path.join(HERE, name)
+    if os.path.exists(sibling):
+        return sibling
+    return shutil.which(name) or f"/usr/bin/{name}"
+
+
+STATUS = tool("slumber-status")
+CTL = tool("slumber-ctl")
+SETUP = tool("slumber-setup")
+
+
+def run(argv, callback=None):
+    """Run argv without blocking the UI; callback(ok, stdout, stderr)."""
+    try:
+        proc = Gio.Subprocess.new(
+            argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE)
+    except GLib.Error as e:
+        if callback:
+            callback(False, "", e.message)
+        return
+
+    def done(p, res):
+        try:
+            _, out, err = p.communicate_utf8_finish(res)
+        except GLib.Error as e:
+            out, err = "", e.message
+        if callback:
+            callback(p.get_successful(), out or "", (err or "").strip())
+
+    proc.communicate_utf8_async(None, None, done)
+
+
+def run_json(argv, callback):
+    def done(ok, out, _err):
+        try:
+            callback(json.loads(out) if ok else None)
+        except ValueError:
+            callback(None)
+    run(argv, done)
+
+
+def fmt_minutes(n):
+    if n is None:
+        return "-"
+    if n % 60 == 0:
+        h = n // 60
+        return f"{h} hour" + ("" if h == 1 else "s")
+    if n > 60:
+        return f"{n // 60} h {n % 60} min"
+    return f"{n} minutes"
+
+
+def fmt_secs(s):
+    h, m = divmod(max(0, s) // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def fmt_left(until):
+    mins = max(1, -(-int(until - time.time()) // 60))
+    h, m = divmod(mins, 60)
+    if h == 0:
+        return f"{m} min left"
+    return f"{h} h left" if m == 0 else f"{h} h {m} min left"
+
+
+def prop_row(title, value, icon=None):
+    row = Adw.ActionRow(title=title, subtitle=value, subtitle_selectable=True)
+    row.add_css_class("property")
+    if icon:
+        row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+    return row
+
+
+# ---------------------------------------------------------------- progress
+
+class RunDialog(Adw.Dialog):
+    """Runs a privileged command and shows its output as it arrives."""
+
+    def __init__(self, title, argv, on_finished):
+        super().__init__(title=title, content_width=580, content_height=440,
+                         can_close=False)
+        self._on_finished = on_finished
+        self._eof = False
+        self._status = None
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar(show_end_title_buttons=False,
+                                       show_start_title_buttons=False))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=12, margin_start=16, margin_end=16)
+
+        top = Gtk.Box(spacing=12)
+        self._spinner = Adw.Spinner()
+        self._headline = Gtk.Label(label="Waiting for approval…", xalign=0, hexpand=True,
+                                   wrap=True)
+        self._headline.add_css_class("heading")
+        top.append(self._spinner)
+        top.append(self._headline)
+        box.append(top)
+
+        self._buffer = Gtk.TextBuffer()
+        text = Gtk.TextView(buffer=self._buffer, editable=False, cursor_visible=False,
+                            monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                            left_margin=8, right_margin=8, top_margin=8, bottom_margin=8)
+        self._scroll = Gtk.ScrolledWindow(vexpand=True, child=text)
+        self._scroll.add_css_class("card")
+        box.append(self._scroll)
+
+        self._close = Gtk.Button(label="Close", halign=Gtk.Align.END, visible=False)
+        self._close.add_css_class("suggested-action")
+        self._close.connect("clicked", lambda *_: self.force_close())
+        box.append(self._close)
+        view.set_content(box)
+        self.set_child(view)
+
+        if os.environ.get("SLUMBER_DRY_RUN"):
+            shown = shlex.join(argv)
+            argv = ["bash", "-c",
+                    f"echo 'dry run, would run: {shown}'; "
+                    "for i in 1 2 3; do echo \"[INFO] step $i\"; sleep 0.5; done; echo '[OK] done'"]
+        self._argv = argv
+
+    def start(self):
+        try:
+            proc = Gio.Subprocess.new(
+                self._argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        except GLib.Error as e:
+            self._append(e.message)
+            self._finish(1)
+            return
+        stream = Gio.DataInputStream.new(proc.get_stdout_pipe())
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line, stream)
+        proc.wait_async(None, self._on_exit)
+
+    def _append(self, line):
+        if self._headline.get_label().startswith("Waiting"):
+            self._headline.set_label("Working… please don't turn the computer off.")
+        self._buffer.insert(self._buffer.get_end_iter(), line + "\n")
+        adj = self._scroll.get_vadjustment()
+        GLib.idle_add(lambda: adj.set_value(adj.get_upper()))
+
+    def _on_line(self, stream, res, _data=None):
+        try:
+            line, _ = stream.read_line_finish_utf8(res)
+        except GLib.Error:
+            line = None
+        if line is None:
+            self._eof = True
+            self._maybe_finish()
+            return
+        self._append(line)
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line, stream)
+
+    def _on_exit(self, proc, res):
+        try:
+            proc.wait_finish(res)
+            self._status = proc.get_exit_status()
+        except GLib.Error:
+            self._status = 1
+        self._maybe_finish()
+
+    def _maybe_finish(self):
+        if self._eof and self._status is not None:
+            self._finish(self._status)
+
+    def _finish(self, status):
+        self._spinner.set_visible(False)
+        if status == 0:
+            self._headline.set_label("Done.")
+        elif status in (126, 127):  # pkexec: dismissed / not authorized
+            self._headline.set_label("Approval was cancelled or denied. Nothing was changed.")
+        else:
+            self._headline.set_label("Something went wrong. The log above shows what happened.")
+        self._close.set_visible(True)
+        self.set_can_close(True)
+        self._on_finished(status)
+
+
+# ------------------------------------------------------------ setup form
+
+class SetupDialog(Adw.Dialog):
+    def __init__(self, data, on_apply):
+        super().__init__(title="Sleep Settings", content_width=520, content_height=640)
+        st = data["status"]
+        settings, helpers, system = st["settings"], st["helpers"], st["system"]
+        self._on_apply = on_apply
+        configured = st["configured"]
+
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: self.close())
+        self._apply = Gtk.Button(label="Apply" if configured else "Enable")
+        self._apply.add_css_class("suggested-action")
+        self._apply.connect("clicked", self._apply_clicked)
+        header.pack_start(cancel)
+        header.pack_end(self._apply)
+        view.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+
+        g = Adw.PreferencesGroup(
+            title="Hibernate after",
+            description="How long the laptop stays in fast suspend on battery before it "
+                        "saves to disk and powers off. On AC power it just stays suspended.")
+        self._delay = Adw.SpinRow.new_with_range(5, 1440, 5)
+        self._delay.set_title("Minutes asleep")
+        self._delay.set_value(settings["delay_minutes"] or 120)
+        g.add(self._delay)
+        page.add(g)
+
+        ram = system["ram_gb"]
+        suggested = system["suggested_swap_gb"]
+        g = Adw.PreferencesGroup(
+            title="Swapfile",
+            description="Hibernation saves your memory to an encrypted swapfile.")
+        self._auto_swap = Adw.SwitchRow(
+            title="Size automatically",
+            subtitle=f"Your RAM + 1 GB: {suggested} GB" if ram else "Your RAM + 1 GB")
+        self._auto_swap.set_active(True)
+        self._swap_gb = Adw.SpinRow.new_with_range(1, 512, 1)
+        self._swap_gb.set_title("Swapfile size (GB)")
+        self._swap_gb.set_value(st["swap"]["size_gb"] or suggested or 16)
+        self._swap_gb.set_sensitive(False)
+        self._auto_swap.connect(
+            "notify::active", lambda r, _p: self._swap_gb.set_sensitive(not r.get_active()))
+        g.add(self._auto_swap)
+        g.add(self._swap_gb)
+        page.add(g)
+
+        g = Adw.PreferencesGroup(title="Extras")
+        gnome = system["desktop"].startswith("GNOME")
+        self._lock = Adw.SwitchRow(
+            title="Sleep after locking",
+            subtitle="On battery, sleep 30 seconds after the screen is locked"
+                     if gnome else "Needs GNOME")
+        self._report = Adw.SwitchRow(
+            title="Sleep battery report",
+            subtitle="Log battery use per sleep and show a notification when you unlock"
+                     if gnome else "Needs GNOME")
+        self._usb = Adw.SwitchRow(
+            title="Block USB wake-ups",
+            subtitle="External USB devices and docks can't wake the laptop")
+        first_time = not configured
+        self._lock.set_active(gnome and (helpers["lock_sleep"] or first_time))
+        self._report.set_active(gnome and (helpers["sleep_report"] or first_time))
+        self._usb.set_active(helpers["usb_guard"] or first_time)
+        self._lock.set_sensitive(gnome)
+        self._report.set_sensitive(gnome)
+        for row in (self._lock, self._report, self._usb):
+            g.add(row)
+        page.add(g)
+
+        view.set_content(page)
+        self.set_child(view)
+
+    def _apply_clicked(self, *_):
+        args = ["enable", str(int(self._delay.get_value()))]
+        if not self._auto_swap.get_active():
+            args.append(f"--swap-size={int(self._swap_gb.get_value())}")
+        if not self._lock.get_active():
+            args.append("--no-lock-sleep")
+        if not self._report.get_active():
+            args.append("--no-sleep-report")
+        if not self._usb.get_active():
+            args.append("--no-usb-guard")
+        self.close()
+        self._on_apply(args)
+
+
+# ------------------------------------------------------------------ window
+
+class SlumberWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Slumber", default_width=640,
+                         default_height=800)
+        self._data = {}
+        self._syncing = False
+        self._busy = False
+        self._dynamic = []  # (group, row) pairs rebuilt on every refresh
+
+        self._toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        menu = Gio.Menu()
+        menu.append("Refresh", "app.refresh")
+        menu.append("Remove Setup…", "app.remove")
+        menu.append("About Slumber", "app.about")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                                       primary=True))
+        view.add_top_bar(header)
+
+        self._page = Adw.PreferencesPage()
+
+        # Overall status + the one big action
+        self._g_state = Adw.PreferencesGroup()
+        self._state_row = Adw.ActionRow()
+        self._state_icon = Gtk.Image(pixel_size=32)
+        self._state_row.add_prefix(self._state_icon)
+        self._setup_btn = Gtk.Button(valign=Gtk.Align.CENTER)
+        self._setup_btn.connect("clicked", self._open_setup)
+        self._state_row.add_suffix(self._setup_btn)
+        self._g_state.add(self._state_row)
+        self._page.add(self._g_state)
+
+        # Why setup can't be offered here
+        self._g_block = Adw.PreferencesGroup(
+            title="Can't be set up on this system",
+            description="Slumber needs Fedora on an encrypted Btrfs disk with hibernation "
+                        "allowed by the kernel.")
+        self._page.add(self._g_block)
+
+        # Quick controls
+        self._g_ctl = Adw.PreferencesGroup(title="Quick controls")
+        self._keep = Adw.SwitchRow(title="Keep awake",
+                                   subtitle="Don't sleep after locking or closing the lid")
+        self._keep.connect("notify::active", self._keep_toggled)
+        self._duration = Adw.ComboRow(title="For how long",
+                                      model=Gtk.StringList.new([d[0] for d in DURATIONS]))
+        self._duration.set_selected(len(DURATIONS) - 1)
+        self._duration.connect("notify::selected", self._duration_changed)
+        self._hib_row = Adw.ActionRow(
+            title="Hibernate now",
+            subtitle="Save to disk and power off right away, for example before putting "
+                     "the laptop in a bag")
+        self._hib_btn = Gtk.Button(label="Hibernate", valign=Gtk.Align.CENTER)
+        self._hib_btn.add_css_class("destructive-action")
+        self._hib_btn.connect("clicked", self._hibernate)
+        self._hib_row.add_suffix(self._hib_btn)
+        for row in (self._keep, self._duration, self._hib_row):
+            self._g_ctl.add(row)
+        self._page.add(self._g_ctl)
+
+        self._g_cfg = Adw.PreferencesGroup(title="Current setup")
+        self._g_bat = Adw.PreferencesGroup(title="Battery")
+        self._g_sleeps = Adw.PreferencesGroup(
+            title="Recent sleeps", description="Newest first")
+        for g in (self._g_cfg, self._g_bat, self._g_sleeps):
+            self._page.add(g)
+
+        view.set_content(self._page)
+        self._toasts.set_child(view)
+        self.set_content(self._toasts)
+
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
+        self.refresh()
+
+    # -- data -----------------------------------------------------------
+
+    def _tick(self):
+        if not self._busy:
+            self.refresh()
+        return GLib.SOURCE_CONTINUE
+
+    def refresh(self, *_):
+        pending = {"status", "ctl"}
+
+        def got(key, value):
+            if value is not None:
+                self._data[key] = value
+            pending.discard(key)
+            if not pending and "status" in self._data:
+                self._update()
+
+        run_json([STATUS, "--json"], lambda v: got("status", v))
+        run_json([CTL, "status", "--json"], lambda v: got("ctl", v))
+
+    def toast(self, text):
+        self._toasts.add_toast(Adw.Toast(title=text, timeout=4))
+
+    # -- rendering ------------------------------------------------------
+
+    def _reset(self, group):
+        for g, row in [d for d in self._dynamic if d[0] is group]:
+            g.remove(row)
+        self._dynamic = [d for d in self._dynamic if d[0] is not group]
+
+    def _add(self, group, row):
+        group.add(row)
+        self._dynamic.append((group, row))
+
+    def _blockers(self, system):
+        out = []
+        if system["distro_id"] != "fedora":
+            out.append(f"Slumber supports Fedora only (this is {system['distro'] or 'unknown'}).")
+        if system["atomic"]:
+            out.append("Fedora Atomic desktops (Silverblue, Kinoite) are not supported.")
+        if system["root_fstype"] != "btrfs":
+            out.append(f"The root filesystem is {system['root_fstype'] or 'unknown'}; Btrfs is required.")
+        elif not system["root_encrypted"]:
+            out.append("The disk is not encrypted. Hibernation would write your memory to "
+                       "disk unencrypted, so Slumber refuses.")
+        if not system["can_hibernate"]:
+            why = " Secure Boot (kernel lockdown) is on; turn it off in the firmware setup." \
+                if system["lockdown"] not in (None, "none") else ""
+            out.append("The kernel does not allow hibernation." + why)
+        return out
+
+    def _update(self):
+        st, ctl = self._data["status"], self._data.get("ctl")
+        settings, system, swap = st["settings"], st["system"], st["swap"]
+        configured = st["configured"]
+        blockers = self._blockers(system)
+
+        # Overall state
+        if configured:
+            self._state_icon.set_from_icon_name("object-select-symbolic")
+            self._state_icon.add_css_class("success")
+            self._state_row.set_title("Suspend-then-hibernate is on")
+            self._state_row.set_subtitle(
+                f"On battery, your laptop hibernates after {fmt_minutes(settings['delay_minutes'])} asleep.")
+            self._setup_btn.set_label("Change Settings…")
+            self._setup_btn.remove_css_class("suggested-action")
+        else:
+            self._state_icon.set_from_icon_name("weather-clear-night-symbolic")
+            self._state_icon.remove_css_class("success")
+            self._state_row.set_title("Not set up")
+            self._state_row.set_subtitle(
+                "Turn on suspend-then-hibernate to save battery while the laptop sleeps.")
+            self._setup_btn.set_label("Set Up…")
+            self._setup_btn.add_css_class("suggested-action")
+        self._setup_btn.set_sensitive(not blockers and not self._busy)
+
+        self._reset(self._g_block)
+        self._g_block.set_visible(bool(blockers) and not configured)
+        for text in blockers:
+            row = Adw.ActionRow(title=text, title_lines=0)
+            row.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
+            self._add(self._g_block, row)
+
+        # Quick controls
+        self._syncing = True
+        mode = (ctl or {}).get("mode")
+        awake = mode == "keep-awake"
+        self._keep.set_active(awake)
+        until = (ctl or {}).get("until")
+        self._keep.set_subtitle(
+            (fmt_left(until) if until else "Until you turn it off") if awake
+            else "Don't sleep after locking or closing the lid")
+        self._syncing = False
+        can_hib = bool((ctl or {}).get("can_hibernate"))
+        self._g_ctl.set_sensitive(True)
+        self._hib_btn.set_sensitive(can_hib)
+        self._hib_row.set_subtitle(
+            "Save to disk and power off right away, for example before putting the laptop in a bag"
+            if can_hib else "Not available until hibernation is set up")
+
+        # Current setup
+        self._reset(self._g_cfg)
+        self._g_cfg.set_visible(configured)
+        if configured:
+            helpers = st["helpers"]
+            rows = [
+                ("Hibernate after", fmt_minutes(settings["delay_minutes"]) + " asleep, on battery"),
+                ("Swapfile", f"{swap['size_gb']} GB, {'active' if swap['active'] else 'not active'}"
+                 if swap["exists"] else "Missing"),
+                ("Resume on boot", "Configured" if st["resume"]["boot_config"] else "Not configured"),
+                ("Lid closed", f"{settings['lid_on_battery'] or '-'} on battery, "
+                               f"{settings['lid_on_ac'] or '-'} on AC"),
+                ("Suspend button", "Suspend-then-hibernate" if settings["suspend_button_is_stages"]
+                 else "Plain suspend"),
+                ("Sleep after locking", "On" if helpers["lock_sleep"] else "Off"),
+                ("Sleep battery report", "On" if helpers["sleep_report"] else "Off"),
+                ("Block USB wake-ups", "On" if helpers["usb_guard"] else "Off"),
+            ]
+            for title, value in rows:
+                self._add(self._g_cfg, prop_row(title, value))
+
+        # Battery
+        bat = st["battery"]
+        self._reset(self._g_bat)
+        self._g_bat.set_visible(bat["present"])
+        if bat["present"]:
+            self._add(self._g_bat, prop_row(
+                "Charge", f"{bat['percent']}%, {(bat['status'] or '').lower()}"
+                          + (" (on AC)" if bat["ac_online"] else ""), "battery-symbolic"))
+            if bat.get("health_percent"):
+                self._add(self._g_bat, prop_row("Battery health", f"{bat['health_percent']}% of design capacity"))
+
+        # Sleeps
+        self._reset(self._g_sleeps)
+        sleeps = list(reversed(st["recent_sleeps"]))
+        self._g_sleeps.set_visible(bool(sleeps))
+        for sl in sleeps:
+            when = time.strftime("%a %d %b, %H:%M", time.localtime(sl["start"]))
+            action = "Hibernated" if "hibernate" in (sl["action"] or "") else "Suspended"
+            delta = sl["pct_end"] - sl["pct_start"]
+            sub = f"Battery {sl['pct_start']}% → {sl['pct_end']}% ({delta:+d}%)"
+            if sl["avg_watts"] is not None:
+                sub += f", about {sl['avg_watts']} W"
+            if sl["on_ac"]:
+                sub += ", on AC"
+            row = Adw.ActionRow(title=f"{when} · {fmt_secs(sl['duration_s'])} · {action}",
+                                subtitle=sub)
+            self._add(self._g_sleeps, row)
+
+    # -- actions --------------------------------------------------------
+
+    def _keep_toggled(self, row, _p):
+        if self._syncing:
+            return
+        if row.get_active():
+            self._apply_keep_awake()
+        else:
+            run([CTL, "allow-sleep"], lambda ok, _o, err: self._after(ok, err))
+
+    def _duration_changed(self, *_):
+        if not self._syncing and self._keep.get_active():
+            self._apply_keep_awake()
+
+    def _apply_keep_awake(self):
+        arg = DURATIONS[self._duration.get_selected()][1]
+        run([CTL, "keep-awake", arg], lambda ok, _o, err: self._after(ok, err))
+
+    def _hibernate(self, *_):
+        run([CTL, "hibernate"], lambda ok, _o, err: None if ok else self.toast(err or "Hibernate failed"))
+
+    def _after(self, ok, err):
+        if not ok:
+            self.toast(err or "That didn't work")
+        self.refresh()
+
+    def _open_setup(self, *_):
+        if "status" in self._data:
+            SetupDialog(self._data, self._run_setup).present(self)
+
+    def _run_setup(self, args):
+        label = "Enabling" if self._data["status"]["configured"] is False else "Applying settings"
+        self._run_privileged(label, args)
+
+    def remove_setup(self, *_):
+        dialog = Adw.AlertDialog(
+            heading="Remove Slumber setup?",
+            body="This turns off suspend-then-hibernate, deletes the swapfile, and restores "
+                 "Fedora's default sleep behaviour.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("remove", "Remove Setup")
+        dialog.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, r: r == "remove" and self._run_privileged("Removing setup", ["disable"]))
+        dialog.present(self)
+
+    def _run_privileged(self, title, args):
+        self._busy = True
+        self._setup_btn.set_sensitive(False)
+
+        def finished(status):
+            self._busy = False
+            self.refresh()
+            if status == 0:
+                self.toast("Done")
+
+        dlg = RunDialog(title, ["pkexec", SETUP, *args], finished)
+        dlg.present(self)
+        dlg.start()
+
+
+class SlumberApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        for name, handler, accel in (
+                ("refresh", lambda *_: self._win().refresh(), "F5"),
+                ("remove", lambda *_: self._win().remove_setup(), None),
+                ("about", self._about, None),
+                ("quit", lambda *_: self.quit(), "<Control>q")):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+            if accel:
+                self.set_accels_for_action(f"app.{name}", [accel])
+
+    def _win(self):
+        return self.props.active_window
+
+    def do_activate(self):
+        (self._win() or SlumberWindow(self)).present()
+
+    def _about(self, *_):
+        Adw.AboutDialog(
+            application_name="Slumber", application_icon=APP_ID, version=VERSION,
+            developer_name="Muhammad Siam",
+            comments="Save battery while your laptop sleeps with suspend-then-hibernate.",
+            website="https://github.com/siamkhandev/suspend-then-hibernate-fedora-44",
+        ).present(self._win())
+
+
+if __name__ == "__main__":
+    sys.exit(SlumberApp().run(sys.argv))
