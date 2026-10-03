@@ -18,8 +18,8 @@ BuildRequires:  appstream
 
 # The app
 Requires:       python3-gobject
-Requires:       gtk4
-Requires:       libadwaita
+Requires:       typelib(Gtk) = 4.0
+Requires:       typelib(Adw) = 1
 Requires:       polkit
 # slumber-setup: swapfile, resume offset, boot configuration
 Requires:       btrfs-progs
@@ -28,8 +28,8 @@ Requires:       dracut
 Requires:       util-linux
 Requires:       systemd
 # helpers: lock-sleep, sleep-notify, sleep-report, usb-wake-guard
-Requires:       glib2
-Requires:       libnotify
+Requires:       /usr/bin/gdbus
+Requires:       /usr/bin/notify-send
 Requires:       procps-ng
 Requires:       gawk
 Recommends:     gnome-shell
