@@ -102,3 +102,23 @@ sudo slumber-setup disable
 ## Important Rules for Dual-Boot (Windows 11)
 - Turn off **Fast Startup** in Windows Control Panel.
 - **Never boot into Windows while Linux is hibernated** if you share data partitions (e.g. NTFS), as this can corrupt filesystem caches. Always resume Linux first before booting into Windows.
+
+---
+
+## Packaging (RPM / COPR)
+
+`packaging/sk-slumber.spec` builds the `sk-slumber` package (`noarch`). With `rpm-build` installed:
+
+```bash
+make rpm      # builds from git HEAD into ./noarch/
+make srpm     # source RPM, e.g. to upload to COPR
+```
+
+`.copr/Makefile` lets COPR build straight from this repository (build method "make srpm"). Users would then run:
+
+```bash
+sudo dnf copr enable <user>/<project>
+sudo dnf install sk-slumber
+```
+
+Installing changes nothing on the system until you enable it from the Slumber app or with `sudo slumber-setup enable`.
