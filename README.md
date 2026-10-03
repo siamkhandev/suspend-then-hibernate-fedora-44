@@ -28,6 +28,7 @@ This project provides automated setup and rollback scripts for enabling Windows-
 
 - `bin/slumber-setup`: `enable` creates the swapfile, configures resume offsets, updates dracut/grub and sets systemd sleep rules; `disable` completely reverts it and returns the system to default Fedora settings; `status` prints the current state.
 - `bin/slumber-status`: reports the current state as text or JSON (`--json`). Needs no root; the GUI reads this.
+- `bin/slumber-ctl`: everyday controls, no root: `keep-awake [30m|2h|forever]` stops `lock-sleep` sleeping after a lock (so a long task keeps running), `allow-sleep` undoes it, `hibernate` hibernates immediately, `status [--json]` shows the mode. Keep-awake resets at logout/reboot and doesn't change lid or power-button behaviour.
 - `bin/` helpers: `lock-sleep`, `sleep-notify`, `sleep-report`, `usb-wake-guard`.
 - `data/`: systemd units (`systemd/system`, `systemd/user`) and the sleep hook (`system-sleep/sleep-battery`, logs to `/var/log/sleep-battery.log`).
 - `Makefile`: `sudo make install` copies everything to `/usr` (use `DESTDIR`/`PREFIX` when packaging).

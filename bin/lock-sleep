@@ -2,7 +2,9 @@
 # On battery, suspend when the screen is locked and idle for DELAY seconds.
 # If woken while still locked (e.g. by an external keyboard/mouse) and left
 # untouched, it suspends again after DELAY seconds.
+# Does nothing while `slumber-ctl keep-awake` is active.
 
+CTL=$(dirname "$(readlink -f "$0")")/slumber-ctl
 DELAY=30   # seconds
 POLL=5     # seconds between checks
 
@@ -36,7 +38,7 @@ while sleep "$POLL"; do
     (( now - prev > POLL + 10 )) && armed_at=$now
     prev=$now
 
-    if ! is_locked || ! on_battery; then
+    if "$CTL" keeping-awake || ! is_locked || ! on_battery; then
         armed_at=0
         continue
     fi

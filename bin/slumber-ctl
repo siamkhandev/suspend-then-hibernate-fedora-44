@@ -1,0 +1,102 @@
+#!/bin/bash
+# Day-to-day controls for Slumber. Needs no root; the top-bar tile and the app
+# call this.
+#
+# Usage:
+#   slumber-ctl keep-awake [DURATION]   don't sleep after locking; DURATION is
+#                                       30m, 2h, 1h30m ... or "forever" (default)
+#   slumber-ctl allow-sleep             back to normal (sleep after locking)
+#   slumber-ctl hibernate               hibernate right now (skips the suspend stage)
+#   slumber-ctl status [--json]         current mode
+#   slumber-ctl keeping-awake           exit 0 if keep-awake is active (for scripts)
+#
+# keep-awake is stored in $XDG_RUNTIME_DIR/slumber/keep-awake as an expiry
+# time (epoch seconds) or "forever", so it resets on logout/reboot. lock-sleep
+# reads it; it does not change lid or power-button behaviour.
+
+STATE_DIR=${SLUMBER_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/slumber}
+STATE=$STATE_DIR/keep-awake
+
+die() { echo "slumber-ctl: $*" >&2; exit 1; }
+
+# "90m", "2h", "1h30m", "45" (minutes) -> seconds on stdout; fails if invalid.
+parse_duration() {
+    local s=$1 total=0 num unit
+    [[ $s =~ ^([0-9]+[hm]?)+$ ]] || return 1
+    while [[ -n $s ]]; do
+        [[ $s =~ ^([0-9]+)([hm]?)(.*)$ ]] || return 1
+        num=${BASH_REMATCH[1]} unit=${BASH_REMATCH[2]} s=${BASH_REMATCH[3]}
+        case $unit in
+            h) total=$(( total + num * 3600 )) ;;
+            *) total=$(( total + num * 60 )) ;;
+        esac
+    done
+    (( total > 0 )) && echo "$total"
+}
+
+# Prints "forever", an expiry epoch, or nothing; clears an expired state.
+read_state() {
+    local v
+    v=$(cat "$STATE" 2>/dev/null) || return 0
+    if [[ $v == forever ]]; then
+        echo forever
+    elif [[ $v =~ ^[0-9]+$ ]] && (( v > $(date +%s) )); then
+        echo "$v"
+    else
+        rm -f "$STATE"
+    fi
+}
+
+can_hibernate() {
+    [[ $(busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager CanHibernate 2>/dev/null) == 's "yes"' ]]
+}
+
+case ${1:-status} in
+    keep-awake)
+        arg=${2:-forever}
+        mkdir -p "$STATE_DIR"
+        if [[ $arg == forever ]]; then
+            echo forever > "$STATE"
+        else
+            secs=$(parse_duration "$arg") || die "invalid duration '$arg' (use e.g. 30m, 2h, 1h30m or forever)"
+            echo $(( $(date +%s) + secs )) > "$STATE"
+        fi
+        ;;
+    allow-sleep)
+        rm -f "$STATE"
+        ;;
+    hibernate)
+        can_hibernate || die "hibernation is not available (run 'sudo slumber-setup enable' first)"
+        exec systemctl hibernate
+        ;;
+    keeping-awake)
+        [[ -n $(read_state) ]]
+        ;;
+    status)
+        until=$(read_state)
+        if [[ ${2:-} == --json ]]; then
+            if [[ -z $until ]]; then
+                mode='"sleep-after-lock"' until_json=null
+            elif [[ $until == forever ]]; then
+                mode='"keep-awake"' until_json=null
+            else
+                mode='"keep-awake"' until_json=$until
+            fi
+            can=false; can_hibernate && can=true
+            printf '{"mode": %s, "until": %s, "can_hibernate": %s}\n' "$mode" "$until_json" "$can"
+        elif [[ -z $until ]]; then
+            echo "Sleeps after lock (normal)"
+        elif [[ $until == forever ]]; then
+            echo "Keeping awake until turned off"
+        else
+            echo "Keeping awake until $(date -d "@$until" '+%H:%M')"
+        fi
+        ;;
+    -h|--help|help)
+        sed -n '2,/^$/{s/^# \{0,1\}//;/^$/d;p}' "$0"
+        ;;
+    *)
+        die "unknown command '$1' (try --help)"
+        ;;
+esac

@@ -5,7 +5,7 @@ BINDIR  ?= $(PREFIX)/bin
 UNITDIR ?= $(PREFIX)/lib/systemd
 DESTDIR ?=
 
-BINS := slumber-setup slumber-status lock-sleep sleep-notify sleep-report usb-wake-guard
+BINS := slumber-setup slumber-status slumber-ctl lock-sleep sleep-notify sleep-report usb-wake-guard
 
 .PHONY: install uninstall check
 
@@ -28,6 +28,6 @@ uninstall:
 		$(DESTDIR)$(UNITDIR)/system-sleep/sleep-battery
 
 check:
-	for b in slumber-setup lock-sleep sleep-notify sleep-report usb-wake-guard; do bash -n bin/$$b; done
+	for b in slumber-setup slumber-ctl lock-sleep sleep-notify sleep-report usb-wake-guard; do bash -n bin/$$b; done
 	bash -n data/system-sleep/sleep-battery
 	PYTHONDONTWRITEBYTECODE=1 python3 -c "import ast,sys; ast.parse(open('bin/slumber-status').read())"
