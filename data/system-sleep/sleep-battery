@@ -2,6 +2,11 @@
 # systemd sleep hook: record battery level before and after every sleep.
 # Installed to /usr/lib/systemd/system-sleep/; runs as root with $1=pre|post,
 # $2=suspend|hibernate|hybrid-sleep|suspend-then-hibernate.
+# Shipped by the package but inactive until `slumber-setup enable` records
+# SLEEP_REPORT=1 in /etc/slumber/slumber.conf.
+
+SLUMBER_CONF=${SLUMBER_CONF:-/etc/slumber/slumber.conf}
+grep -qx 'SLEEP_REPORT=1' "$SLUMBER_CONF" 2>/dev/null || exit 0
 
 LOG=${SLEEP_BATTERY_LOG:-/var/log/sleep-battery.log}
 STATE=${SLEEP_BATTERY_STATE:-/run/sleep-battery.pre}

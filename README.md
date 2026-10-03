@@ -10,7 +10,7 @@ This project provides automated setup and rollback scripts for enabling Windows-
 5. **Lock → Sleep (optional)**: On battery, locking the screen (Super+L) suspends after 30 seconds idle. If an external keyboard/mouse wakes it and nobody unlocks, it goes back to sleep after another 30 seconds. On AC power, locking never sleeps (downloads/builds keep running).
 6. **Sleep Battery Report (optional)**: A systemd sleep hook records battery level before/after every sleep. When you unlock after waking, a notification shows how long it slept, whether it hibernated, and how much battery it used. Run `sleep-report` for the full history.
 7. **USB Can't Wake It (optional)**: `usb-wake-guard.service` turns off wakeup for external USB devices and for the USB controllers (xHCI, Thunderbolt/USB4) before every sleep and restores it on resume, so a bumped mouse or keyboard, or a dock, can't wake the laptop. Only the built-in PS/2 or I2C keyboard and trackpad, power button and lid still can. Bluetooth mice (the radio is on USB) can't wake it either. If your built-in keyboard or trackpad is a USB device, use `--no-usb-guard`.
-8. **Swap Sized to Your RAM**: The swapfile is sized automatically to installed RAM (rounded up) + 1GB, e.g. 16GB RAM → 17GB, 32GB RAM → 33GB. If an existing swapfile is too small (e.g. after a RAM upgrade), re-running the script recreates it and updates the resume offset in every boot entry. Override with `--swap-size=N`.
+8. **Swap Sized to Your RAM**: The swapfile is sized automatically to installed RAM (rounded up) + 1GB, e.g. 16GB RAM → 17GB, 32GB RAM → 33GB. If an existing swapfile is too small (e.g. after a RAM upgrade), re-running `slumber-setup enable` recreates it and updates the resume offset in every boot entry. Override with `--swap-size=N`.
 9. **Zero Performance Lag**: Fedora's default `zram0` (in-memory swap) remains at priority 100, while the SSD swapfile is set to priority 10. The SSD is only used for hibernation, never for normal daily multitasking.
 
 ---
@@ -26,38 +26,46 @@ This project provides automated setup and rollback scripts for enabling Windows-
 
 ## Files
 
-- `enable-suspend-then-hibernate.sh`: Creates the swapfile, configures resume offsets, updates dracut/grub, and sets systemd sleep rules.
-- `disable-suspend-then-hibernate.sh`: Completely reverts all changes (including the helpers below) and returns the system to default Fedora settings.
-- `files/`: Helpers installed by the enable script:
-  - `lock-sleep`, `lock-sleep.service` → `/usr/local/bin/`, `/etc/systemd/user/` (enabled globally)
-  - `sleep-notify`, `sleep-notify.service` → `/usr/local/bin/`, `/etc/systemd/user/` (enabled globally)
-  - `usb-wake-guard`, `usb-wake-guard.service` → `/usr/local/bin/`, `/etc/systemd/system/` (system service, wanted by `sleep.target`)
-  - `sleep-report` → `/usr/local/bin/`
-  - `sleep-battery-hook` → `/usr/lib/systemd/system-sleep/sleep-battery` (logs to `/var/log/sleep-battery.log`)
+- `bin/slumber-setup`: `enable` creates the swapfile, configures resume offsets, updates dracut/grub and sets systemd sleep rules; `disable` completely reverts it and returns the system to default Fedora settings; `status` prints the current state.
+- `bin/slumber-status`: reports the current state as text or JSON (`--json`). Needs no root; the GUI reads this.
+- `bin/` helpers: `lock-sleep`, `sleep-notify`, `sleep-report`, `usb-wake-guard`.
+- `data/`: systemd units (`systemd/system`, `systemd/user`) and the sleep hook (`system-sleep/sleep-battery`, logs to `/var/log/sleep-battery.log`).
+- `Makefile`: `sudo make install` copies everything to `/usr` (use `DESTDIR`/`PREFIX` when packaging).
+
+The helpers are only installed by `make install` (or the package); `slumber-setup enable` switches them on or off. What is enabled is recorded in `/etc/slumber/slumber.conf`, and the sleep hook stays inactive until the sleep report is enabled there.
 
 ---
 
 ## Usage
 
-### 1. Enable (or Adjust Delay)
+### 1. Install, then enable (or adjust delay)
+```bash
+sudo make install
+```
+
 Run interactively (you will be prompted to enter the desired delay in minutes):
 ```bash
-sudo bash enable-suspend-then-hibernate.sh
+sudo slumber-setup enable
 ```
 
 Or pass the delay directly as an argument (e.g. 60 minutes, 90 minutes, 180 minutes):
 ```bash
-sudo bash enable-suspend-then-hibernate.sh 60
+sudo slumber-setup enable 60
 ```
 
 Set the swapfile size yourself (in GB) instead of sizing it to RAM:
 ```bash
-sudo bash enable-suspend-then-hibernate.sh 30 --swap-size=40
+sudo slumber-setup enable 30 --swap-size=40
 ```
 
-Skip the optional helpers with `--no-lock-sleep`, `--no-sleep-report` and/or `--no-usb-guard`:
+Skip the optional helpers with `--no-lock-sleep`, `--no-sleep-report` and/or `--no-usb-guard` (re-running with different flags switches helpers on or off):
 ```bash
-sudo bash enable-suspend-then-hibernate.sh 30 --no-lock-sleep
+sudo slumber-setup enable 30 --no-lock-sleep
+```
+
+Check the current state:
+```bash
+slumber-status          # or: slumber-status --json
 ```
 
 ### 2. Test
@@ -76,7 +84,7 @@ sleep-report
 
 ### 3. Revert (if ever needed)
 ```bash
-sudo bash disable-suspend-then-hibernate.sh
+sudo slumber-setup disable
 ```
 
 ---

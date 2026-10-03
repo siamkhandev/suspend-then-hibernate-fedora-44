@@ -1,0 +1,290 @@
+#!/usr/bin/python3
+"""Report the state of Slumber (suspend-then-hibernate) as JSON or text.
+
+Usage: slumber-status [--json] [--sleeps N]
+
+Needs no root. Everything is read from /sys, /proc, systemd drop-ins and the
+sleep log, so it is safe to call often; the GUI polls it.
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+SWAP_FILE = os.environ.get("SLUMBER_SWAP_FILE", "/swap/swapfile")
+SLEEP_CONF = "/etc/systemd/sleep.conf.d/suspend-then-hibernate.conf"
+LOGIND_CONF = "/etc/systemd/logind.conf.d/suspend-then-hibernate.conf"
+SUSPEND_OVERRIDE = "/etc/systemd/system/systemd-suspend.service.d/suspend-then-hibernate.conf"
+DRACUT_CONF = "/etc/dracut.conf.d/resume.conf"
+SLUMBER_CONF = os.environ.get("SLUMBER_CONF", "/etc/slumber/slumber.conf")
+SLEEP_LOG = os.environ.get("SLEEP_BATTERY_LOG", "/var/log/sleep-battery.log")
+POWER_SUPPLY = os.environ.get("SLUMBER_POWER_SUPPLY", "/sys/class/power_supply")
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_int(path):
+    value = read(path)
+    return int(value) if value and value.lstrip("-").isdigit() else None
+
+
+def parse_kv(path, sep="="):
+    """key=value lines (ignoring comments and [sections])."""
+    out = {}
+    text = read(path)
+    if not text:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;[" or sep not in line:
+            continue
+        key, value = line.split(sep, 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def run(*cmd):
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def os_release():
+    info = parse_kv("/etc/os-release")
+    return {k: v.strip('"') for k, v in info.items()}
+
+
+def ram_gb():
+    for line in (read("/proc/meminfo") or "").splitlines():
+        if line.startswith("MemTotal:"):
+            kb = int(line.split()[1])
+            return -(-kb // (1024 * 1024))  # round up to whole GiB
+    return None
+
+
+def root_info():
+    """Filesystem and whether the block device under / is LUKS-encrypted."""
+    fstype = run("findmnt", "-no", "FSTYPE", "/")
+    source = run("findmnt", "-no", "SOURCE", "/") or ""
+    dev = source.split("[", 1)[0]
+    encrypted = False
+    if dev:
+        for flags in (["-no", "TYPE"], ["-s", "-no", "TYPE"]):
+            types = run("lsblk", *flags, dev) or ""
+            if "crypt" in types.split():
+                encrypted = True
+                break
+    return fstype, encrypted
+
+
+def desktop():
+    if run("pgrep", "-u", str(os.getuid()), "-x", "gnome-shell") is not None:
+        return "GNOME"
+    if run("pgrep", "-u", str(os.getuid()), "-x", "plasmashell") is not None:
+        return "KDE Plasma"
+    return os.environ.get("XDG_CURRENT_DESKTOP", "unknown")
+
+
+def lockdown_mode():
+    text = read("/sys/kernel/security/lockdown") or ""
+    m = re.search(r"\[(\w+)\]", text)
+    return m.group(1) if m else None
+
+
+def swap_info():
+    exists = os.path.isfile(SWAP_FILE)
+    size_gb = round(os.path.getsize(SWAP_FILE) / 1024 ** 3, 1) if exists else None
+    active, priority = False, None
+    for line in (read("/proc/swaps") or "").splitlines()[1:]:
+        cols = line.split()
+        if cols and cols[0] == SWAP_FILE:
+            active, priority = True, int(cols[4])
+    return {"path": SWAP_FILE, "exists": exists, "size_gb": size_gb,
+            "active": active, "priority": priority}
+
+
+def battery_info():
+    bat, ac = None, False
+    for ps in sorted(glob.glob(os.path.join(POWER_SUPPLY, "*"))):
+        kind = read(os.path.join(ps, "type"))
+        if kind == "Battery" and bat is None:
+            bat = ps
+        elif kind == "Mains" and read(os.path.join(ps, "online")) == "1":
+            ac = True
+        elif kind not in ("Battery", "Mains") and read(os.path.join(ps, "online")) == "1":
+            ac = True
+    if bat is None:
+        return {"present": False, "ac_online": ac}
+    energy_now = read_int(os.path.join(bat, "energy_now"))
+    energy_full = read_int(os.path.join(bat, "energy_full"))
+    design = read_int(os.path.join(bat, "energy_full_design"))
+    if energy_now is None:  # charge-reporting batteries (uAh * uV)
+        volt = read_int(os.path.join(bat, "voltage_now"))
+        for name in ("charge_now", "charge_full", "charge_full_design"):
+            val = read_int(os.path.join(bat, name))
+            val = val * volt // 1_000_000 if val is not None and volt else None
+            if name == "charge_now":
+                energy_now = val
+            elif name == "charge_full":
+                energy_full = val
+            else:
+                design = val
+    health = round(100 * energy_full / design) if energy_full and design else None
+    return {"present": True, "ac_online": ac,
+            "percent": read_int(os.path.join(bat, "capacity")),
+            "status": read(os.path.join(bat, "status")),
+            "energy_wh": round(energy_now / 1e6, 1) if energy_now else None,
+            "health_percent": health}
+
+
+def recent_sleeps(limit):
+    text = read(SLEEP_LOG)
+    if not text:
+        return []
+    sleeps = []
+    for line in text.splitlines()[-limit:]:
+        v = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
+        try:
+            start, end = int(v["start"]), int(v["end"])
+            wh = (int(v["uwh_start"]) - int(v["uwh_end"])) / 1e6
+        except (KeyError, ValueError):
+            continue
+        secs = end - start
+        sleeps.append({
+            "start": start, "end": end, "duration_s": secs,
+            "action": v.get("action"), "on_ac": v.get("ac") == "1",
+            "pct_start": int(v.get("pct_start", 0)), "pct_end": int(v.get("pct_end", 0)),
+            "drain_wh": round(wh, 2),
+            "avg_watts": round(wh * 3600 / secs, 2) if secs > 60 else None,
+        })
+    return sleeps
+
+
+def minutes(value):
+    """'120min' / '2h' / '3600' (systemd time span) -> minutes, or None."""
+    if not value:
+        return None
+    total, found = 0.0, False
+    for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]*)", value):
+        factor = {"": 1 / 60, "s": 1 / 60, "sec": 1 / 60, "m": 1, "min": 1, "h": 60,
+                  "hr": 60, "d": 1440}.get(unit)
+        if factor is None:
+            return None
+        total += float(num) * factor
+        found = True
+    return int(round(total)) if found else None
+
+
+def collect(sleeps):
+    sleep_conf = parse_kv(SLEEP_CONF)
+    logind = parse_kv(LOGIND_CONF)
+    slumber = parse_kv(SLUMBER_CONF)
+    cmdline = read("/proc/cmdline") or ""
+    resume = re.search(r"\bresume=(\S+)", cmdline)
+    offset = re.search(r"\bresume_offset=(\d+)", cmdline)
+    release = os_release()
+    fstype, encrypted = root_info()
+    state = read("/sys/power/state") or ""
+    can_hibernate = "disk" in state.split()
+    swap = swap_info()
+    ram = ram_gb()
+    override = read(SUSPEND_OVERRIDE) or ""
+
+    configured = bool(sleep_conf) and swap["exists"]
+    return {
+        "configured": configured,
+        "settings": {
+            "delay_minutes": minutes(sleep_conf.get("HibernateDelaySec")),
+            "hibernate_mode": sleep_conf.get("HibernateMode"),
+            "hibernate_on_ac_power": sleep_conf.get("HibernateOnACPower"),
+            "lid_on_battery": logind.get("HandleLidSwitch"),
+            "lid_on_ac": logind.get("HandleLidSwitchExternalPower"),
+            "suspend_button_is_stages": "suspend-then-hibernate" in override,
+        },
+        "helpers": {
+            "lock_sleep": slumber.get("LOCK_SLEEP") == "1",
+            "sleep_report": slumber.get("SLEEP_REPORT") == "1",
+            "usb_guard": slumber.get("USB_GUARD") == "1",
+        },
+        "swap": swap,
+        "resume": {
+            "kernel_args_present": bool(resume and offset),
+            "dracut_module": os.path.exists(DRACUT_CONF),
+        },
+        "system": {
+            "can_hibernate": can_hibernate,
+            "lockdown": lockdown_mode(),
+            "ram_gb": ram,
+            "suggested_swap_gb": ram + 1 if ram else None,
+            "distro": release.get("PRETTY_NAME"),
+            "distro_id": release.get("ID"),
+            "distro_version": release.get("VERSION_ID"),
+            "atomic": os.path.exists("/run/ostree-booted"),
+            "root_fstype": fstype,
+            "root_encrypted": encrypted,
+            "desktop": desktop(),
+        },
+        "battery": battery_info(),
+        "recent_sleeps": recent_sleeps(sleeps),
+    }
+
+
+def yn(value):
+    return "yes" if value else "no"
+
+
+def render_text(d):
+    s, sw, sy, b = d["settings"], d["swap"], d["system"], d["battery"]
+    lines = [
+        f"Slumber:            {'configured' if d['configured'] else 'not set up'}",
+        f"Hibernate delay:    {s['delay_minutes']} min" if s["delay_minutes"] else "Hibernate delay:    -",
+        f"Hibernate mode:     {s['hibernate_mode'] or '-'}",
+        f"Lid (battery / AC): {s['lid_on_battery'] or '-'} / {s['lid_on_ac'] or '-'}",
+        f"Suspend button:     {'suspend-then-hibernate' if s['suspend_button_is_stages'] else 'plain suspend'}",
+        f"Swapfile:           {sw['size_gb']} GB, {'active' if sw['active'] else 'inactive'}"
+        if sw["exists"] else "Swapfile:           missing",
+        f"Resume args:        {yn(d['resume']['kernel_args_present'])}",
+        f"Can hibernate:      {yn(sy['can_hibernate'])}"
+        + (f" (kernel lockdown: {sy['lockdown']})" if sy["lockdown"] not in (None, "none") else ""),
+        f"Helpers:            lock-sleep={yn(d['helpers']['lock_sleep'])} "
+        f"report={yn(d['helpers']['sleep_report'])} usb-guard={yn(d['helpers']['usb_guard'])}",
+    ]
+    if b["present"]:
+        lines.append(f"Battery:            {b['percent']}% ({b['status']}), AC {yn(b['ac_online'])}")
+    for sl in d["recent_sleeps"]:
+        lines.append(f"  sleep {sl['duration_s'] // 60} min, {sl['action']}, "
+                     f"{sl['pct_start']}% -> {sl['pct_end']}%")
+    return "\n".join(lines)
+
+
+def main(argv):
+    as_json, sleeps = False, 10
+    args = iter(argv)
+    for arg in args:
+        if arg == "--json":
+            as_json = True
+        elif arg == "--sleeps":
+            sleeps = int(next(args, "10"))
+        elif arg in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            print(f"slumber-status: unknown option {arg}", file=sys.stderr)
+            return 2
+    data = collect(sleeps)
+    print(json.dumps(data, indent=2) if as_json else render_text(data))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

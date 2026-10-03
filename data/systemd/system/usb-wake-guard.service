@@ -1,6 +1,6 @@
 [Unit]
 Description=Block external USB devices from waking the system
-Documentation=file:///usr/local/bin/usb-wake-guard
+Documentation=file:///usr/bin/usb-wake-guard
 # Runs before every kind of sleep (suspend, hibernate, suspend-then-hibernate)
 # and is stopped again when sleep.target goes away after resume.
 Before=sleep.target
@@ -9,8 +9,8 @@ StopWhenUnneeded=yes
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/usb-wake-guard block
-ExecStop=/usr/local/bin/usb-wake-guard restore
+ExecStart=/usr/bin/usb-wake-guard block
+ExecStop=/usr/bin/usb-wake-guard restore
 
 [Install]
 WantedBy=sleep.target

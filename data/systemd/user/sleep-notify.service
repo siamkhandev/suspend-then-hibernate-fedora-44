@@ -1,10 +1,10 @@
 [Unit]
-Description=Suspend 30s after the screen is locked and idle
+Description=Notify battery drain after waking from sleep
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=/usr/local/bin/lock-sleep
+ExecStart=/usr/bin/sleep-notify
 Restart=on-failure
 
 [Install]

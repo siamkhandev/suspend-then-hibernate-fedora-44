@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script: enable-suspend-then-hibernate.sh
-# Purpose: Enable Windows-level "Suspend-then-Hibernate" on Fedora 44 (Btrfs + LUKS)
-# Author: Generated with Antigravity (Hardened & Audited)
+# slumber-setup: configure or revert Windows-style Suspend-then-Hibernate
+#                on Fedora (Btrfs + LUKS)
+#
+# Usage:
+#   sudo slumber-setup enable [DELAY_MINUTES] [--swap-size=GB]
+#                             [--no-lock-sleep] [--no-sleep-report] [--no-usb-guard]
+#   sudo slumber-setup disable
+#        slumber-setup status [--json]        (no root needed)
+#
+# Machine-specific work lives here (swapfile, resume offset, grub/dracut,
+# systemd sleep policy). The helper programs and unit files (lock-sleep,
+# sleep-notify, sleep-report, usb-wake-guard, the sleep hook) are shipped by the
+# package; this command only turns them on or off. What was enabled is recorded
+# in /etc/slumber/slumber.conf.
 #
 # Hardening & Security Features:
 # 1. Enforces LUKS/dm-crypt encryption verification on underlying block storage
@@ -14,6 +25,8 @@
 # 7. Non-disruptive SIGHUP reload of systemd-logind (avoids session drops)
 # 8. Automatic SELinux context restoration (restorecon)
 # 9. Sanitized output (redacted physical block offsets)
+# 10. Disable is boot-safe: cleans kernel cmdline, BLS and dracut BEFORE deleting
+#     swap, and zeroes the swap header before unlinking
 #
 # Behaviour:
 # - HibernateMode=shutdown: hibernation fully powers off (no S4 residual drain)
@@ -22,9 +35,6 @@
 # - lock-sleep (optional): on battery, sleep 30s after locking the screen
 # - Sleep battery report (optional): logs drain per sleep, notifies on unlock
 # - Swapfile sized to installed RAM + 1GB (recreated if an existing one is too small)
-#
-# Usage: sudo bash enable-suspend-then-hibernate.sh [DELAY_MINUTES]
-#            [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report] [--no-usb-guard]
 # ==============================================================================
 
 set -euo pipefail
@@ -39,13 +49,14 @@ LOGIND_CONF_DIR="/etc/systemd/logind.conf.d"
 LOGIND_CONF="${LOGIND_CONF_DIR}/suspend-then-hibernate.conf"
 GRUB_DEFAULT="/etc/default/grub"
 KERNEL_CMDLINE="/etc/kernel/cmdline"
+FSTAB="/etc/fstab"
 SUSPEND_OVERRIDE_DIR="/etc/systemd/system/systemd-suspend.service.d"
 SUSPEND_OVERRIDE="${SUSPEND_OVERRIDE_DIR}/suspend-then-hibernate.conf"
-SLEEP_HOOK="/usr/lib/systemd/system-sleep/sleep-battery"
-BIN_DIR="/usr/local/bin"
-USER_UNIT_DIR="/etc/systemd/user"
-SYSTEM_UNIT_DIR="/etc/systemd/system"
-FILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/files"
+SLUMBER_CONF_DIR="/etc/slumber"
+SLUMBER_CONF="${SLUMBER_CONF_DIR}/slumber.conf"
+SLEEP_LOG="/var/log/sleep-battery.log"
+SLEEP_STATE="/run/sleep-battery.pre"
+SYSTEMD_LIB="/usr/lib/systemd"
 DEFAULT_DELAY_MINUTES=120
 HIBERNATE_DELAY_MINUTES="${DEFAULT_DELAY_MINUTES}"
 DELAY_ARG=""
@@ -53,25 +64,60 @@ INSTALL_LOCK_SLEEP=true
 INSTALL_SLEEP_REPORT=true
 INSTALL_USB_GUARD=true
 
-# Colors for terminal output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Colors for terminal output (plain text when piped, e.g. when the GUI reads it)
+if [ -t 1 ]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''
+fi
 
 log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+usage() {
+    cat << 'EOF'
+Usage:
+  sudo slumber-setup enable [DELAY_MINUTES] [--swap-size=GB]
+                            [--no-lock-sleep] [--no-sleep-report] [--no-usb-guard]
+  sudo slumber-setup disable
+       slumber-setup status [--json]
+EOF
+}
+
 check_root() {
     if [ "${EUID}" -ne 0 ]; then
-        log_error "This script requires root privileges. Please run with sudo:"
-        echo "  sudo bash $0"
+        log_error "This command requires root privileges. Please run with sudo:"
+        echo "  sudo $0 $*"
         exit 1
     fi
 }
+
+# The human who started this, whether via sudo or pkexec.
+invoking_user() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        echo "${SUDO_USER}"
+    elif [ -n "${PKEXEC_UID:-}" ]; then
+        getent passwd "${PKEXEC_UID}" | cut -d: -f1
+    fi
+}
+
+# Run a `systemctl --user` command in the invoking user's session, if any.
+user_systemctl() {
+    local user uid
+    user=$(invoking_user)
+    [ -n "${user}" ] && [ "${user}" != "root" ] || return 0
+    uid=$(id -u "${user}")
+    [ -S "/run/user/${uid}/bus" ] || return 0
+    runuser -u "${user}" -- env XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        systemctl --user "$@" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# enable
+# ------------------------------------------------------------------------------
 
 check_os_and_desktop() {
     log_info "Checking distribution and desktop environment..."
@@ -85,7 +131,7 @@ check_os_and_desktop() {
         os_name=$(. /etc/os-release && echo "${PRETTY_NAME:-${NAME:-unknown}}")
     fi
     if [ "${os_id}" != "fedora" ]; then
-        log_error "This script supports Fedora only; detected '${os_name:-unknown}'."
+        log_error "Slumber supports Fedora only; detected '${os_name:-unknown}'."
         exit 1
     fi
 
@@ -105,8 +151,9 @@ check_os_and_desktop() {
 
     # 3. GNOME is required only for lock-sleep and the unlock notification
     #    (they use GNOME's ScreenSaver and Mutter idle D-Bus APIs).
-    #    sudo drops XDG_CURRENT_DESKTOP, so look for the user's gnome-shell.
-    local user="${SUDO_USER:-}" desktop="unknown"
+    #    sudo/pkexec drop XDG_CURRENT_DESKTOP, so look for the user's gnome-shell.
+    local user desktop="unknown"
+    user=$(invoking_user)
     if [ -n "${user}" ] && pgrep -u "${user}" -x gnome-shell &>/dev/null; then
         desktop="GNOME"
     elif [ -n "${user}" ] && pgrep -u "${user}" -x plasmashell &>/dev/null; then
@@ -168,7 +215,7 @@ check_prerequisites() {
         log_error "The kernel does not allow hibernation on this system."
         if grep -qE '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown 2>/dev/null; then
             log_error "Kernel lockdown is active (usually because Secure Boot is enabled)."
-            log_error "Disable Secure Boot in the firmware setup, then run this script again."
+            log_error "Disable Secure Boot in the firmware setup, then run this again."
         fi
         exit 1
     fi
@@ -198,12 +245,22 @@ check_prerequisites() {
     done
     log_success "All required CLI tools are present."
 
-    # 6. Helper files shipped next to this script
-    if [ "${INSTALL_LOCK_SLEEP}" = true ] || [ "${INSTALL_SLEEP_REPORT}" = true ]; then
-        if [ ! -d "${FILES_DIR}" ]; then
-            log_error "Helper directory '${FILES_DIR}' not found. Run this script from a full checkout of the repository."
-            exit 1
-        fi
+    # 6. Helper programs and unit files shipped by the package
+    local missing=false
+    if [ "${INSTALL_LOCK_SLEEP}" = true ]; then
+        [ -f "${SYSTEMD_LIB}/user/lock-sleep.service" ] || missing=true
+    fi
+    if [ "${INSTALL_SLEEP_REPORT}" = true ]; then
+        [ -f "${SYSTEMD_LIB}/user/sleep-notify.service" ] || missing=true
+        [ -f "${SYSTEMD_LIB}/system-sleep/sleep-battery" ] || missing=true
+    fi
+    if [ "${INSTALL_USB_GUARD}" = true ]; then
+        [ -f "${SYSTEMD_LIB}/system/usb-wake-guard.service" ] || missing=true
+    fi
+    if [ "${missing}" = true ]; then
+        log_error "Slumber helper files are missing from ${SYSTEMD_LIB}. Reinstall the package"
+        log_error "(or run 'make install' from a source checkout)."
+        exit 1
     fi
 }
 
@@ -221,7 +278,7 @@ compute_swap_size() {
     log_info "Detected ${ram_gb}GB RAM; swapfile size: ${SWAP_GB}GB."
 }
 
-parse_args() {
+parse_enable_args() {
     for arg in "$@"; do
         case "${arg}" in
             --no-lock-sleep)    INSTALL_LOCK_SLEEP=false ;;
@@ -235,10 +292,8 @@ parse_args() {
                     exit 1
                 fi
                 ;;
-            -h|--help)
-                echo "Usage: sudo bash $0 [DELAY_MINUTES] [--swap-size=GB] [--no-lock-sleep] [--no-sleep-report] [--no-usb-guard]"
-                exit 0
-                ;;
+            -h|--help)          usage; exit 0 ;;
+            -*)                 log_error "Unknown option '${arg}'."; usage; exit 2 ;;
             *)                  DELAY_ARG="${arg}" ;;
         esac
     done
@@ -310,7 +365,7 @@ create_btrfs_swapfile() {
             if swapon --show=NAME --noheadings | grep -qxF "${SWAP_FILE}"; then
                 if ! swapoff "${SWAP_FILE}"; then
                     log_error "Could not deactivate ${SWAP_FILE} (not enough free RAM to move its pages?)."
-                    log_error "Close some applications or reboot, then run this script again."
+                    log_error "Close some applications or reboot, then run this again."
                     exit 1
                 fi
             fi
@@ -338,12 +393,12 @@ create_btrfs_swapfile() {
     fi
 
     # Configure /etc/fstab with lower priority (pri=10) so fast zram (pri=100) handles daily RAM paging
-    if ! grep -qs "${SWAP_FILE}" /etc/fstab; then
+    if ! grep -qs "${SWAP_FILE}" "${FSTAB}"; then
         log_info "Registering swapfile in /etc/fstab with priority 10..."
-        if [ ! -f "/etc/fstab.bak" ]; then
-            cp -a "/etc/fstab" "/etc/fstab.bak"
+        if [ ! -f "${FSTAB}.bak" ]; then
+            cp -a "${FSTAB}" "${FSTAB}.bak"
         fi
-        echo -e "${SWAP_FILE}\tnone\tswap\tdefaults,pri=10\t0 0" >> /etc/fstab
+        echo -e "${SWAP_FILE}\tnone\tswap\tdefaults,pri=10\t0 0" >> "${FSTAB}"
         log_success "/etc/fstab backed up and updated."
     else
         log_info "/etc/fstab already contains ${SWAP_FILE}."
@@ -515,57 +570,61 @@ INNER_EOF
     log_success "Systemd and logind reloaded cleanly without session disruption."
 }
 
-# Run a `systemctl --user` command in the invoking (sudo) user's session, if any.
-user_systemctl() {
-    local user="${SUDO_USER:-}" uid
-    [ -n "${user}" ] && [ "${user}" != "root" ] || return 0
-    uid=$(id -u "${user}")
-    [ -S "/run/user/${uid}/bus" ] || return 0
-    runuser -u "${user}" -- env XDG_RUNTIME_DIR="/run/user/${uid}" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
-        systemctl --user "$@" 2>/dev/null || true
+# Turn one optional user service on (when $2 is true) or off, for every user's
+# graphical session, and start/stop it for the invoking user.
+set_user_service() {
+    local name="$1" enabled="$2"
+    if [ "${enabled}" = true ]; then
+        systemctl --global enable "${name}.service"
+        user_systemctl daemon-reload
+        user_systemctl restart "${name}.service"
+    else
+        user_systemctl stop "${name}.service"
+        systemctl --global disable "${name}.service" 2>/dev/null || true
+    fi
 }
 
-install_user_service() {
-    local name="$1"
-    install -m 0755 "${FILES_DIR}/${name}" "${BIN_DIR}/${name}"
-    install -m 0644 "${FILES_DIR}/${name}.service" "${USER_UNIT_DIR}/${name}.service"
-    # Enable for every user's graphical session, then start it for the current one.
-    systemctl --global enable "${name}.service"
-    user_systemctl daemon-reload
-    user_systemctl restart "${name}.service"
-}
+# Enable the optional helpers that were requested and disable the others, so
+# re-running with different flags (as the GUI does) converges on the request.
+apply_helpers() {
+    log_info "Applying optional helpers..."
 
-install_extras() {
-    mkdir -p "${USER_UNIT_DIR}"
-
+    set_user_service lock-sleep "${INSTALL_LOCK_SLEEP}"
     if [ "${INSTALL_LOCK_SLEEP}" = true ]; then
-        log_info "Installing lock-sleep (sleep 30s after locking, on battery only)..."
-        install_user_service lock-sleep
-        log_success "lock-sleep installed and enabled for all users."
+        log_success "lock-sleep enabled (sleep 30s after locking, on battery only)."
     fi
 
+    # The sleep hook ships with the package but only logs when SLEEP_REPORT=1
+    # in slumber.conf (written below).
+    set_user_service sleep-notify "${INSTALL_SLEEP_REPORT}"
     if [ "${INSTALL_SLEEP_REPORT}" = true ]; then
-        log_info "Installing sleep battery report (hook, unlock notification, sleep-report)..."
-        # systemd-sleep only runs hooks from /usr/lib/systemd/system-sleep/.
-        install -D -m 0755 "${FILES_DIR}/sleep-battery-hook" "${SLEEP_HOOK}"
-        install -m 0755 "${FILES_DIR}/sleep-report" "${BIN_DIR}/sleep-report"
-        install_user_service sleep-notify
-        log_success "Sleep battery report installed (log: /var/log/sleep-battery.log)."
+        log_success "Sleep battery report enabled (log: ${SLEEP_LOG}; run 'sleep-report')."
     fi
 
+    systemctl daemon-reload
     if [ "${INSTALL_USB_GUARD}" = true ]; then
-        log_info "Installing usb-wake-guard (USB devices and controllers can't wake from sleep)..."
-        install -m 0755 "${FILES_DIR}/usb-wake-guard" "${BIN_DIR}/usb-wake-guard"
-        install -m 0644 "${FILES_DIR}/usb-wake-guard.service" "${SYSTEM_UNIT_DIR}/usb-wake-guard.service"
-        systemctl daemon-reload
         systemctl enable usb-wake-guard.service
-        log_success "usb-wake-guard installed; only the built-in keyboard, trackpad, power button and lid wake the machine."
+        log_success "usb-wake-guard enabled; only the built-in keyboard, trackpad, power button and lid wake the machine."
+    else
+        systemctl stop usb-wake-guard.service 2>/dev/null || true
+        systemctl disable usb-wake-guard.service 2>/dev/null || true
     fi
+}
 
+write_slumber_conf() {
+    mkdir -p "${SLUMBER_CONF_DIR}"
+    cat > "${SLUMBER_CONF}" << INNER_EOF
+# Written by slumber-setup. Records what is enabled; do not edit by hand.
+ENABLED=1
+DELAY_MINUTES=${HIBERNATE_DELAY_MINUTES}
+SWAP_GB=${SWAP_GB}
+LOCK_SLEEP=$([ "${INSTALL_LOCK_SLEEP}" = true ] && echo 1 || echo 0)
+SLEEP_REPORT=$([ "${INSTALL_SLEEP_REPORT}" = true ] && echo 1 || echo 0)
+USB_GUARD=$([ "${INSTALL_USB_GUARD}" = true ] && echo 1 || echo 0)
+INNER_EOF
+    chmod 0644 "${SLUMBER_CONF}"
     if command -v restorecon &>/dev/null; then
-        restorecon -F "${SLEEP_HOOK}" "${BIN_DIR}"/usb-wake-guard "${SYSTEM_UNIT_DIR}"/usb-wake-guard.service "${BIN_DIR}"/lock-sleep "${BIN_DIR}"/sleep-notify \
-            "${BIN_DIR}"/sleep-report "${USER_UNIT_DIR}"/*.service 2>/dev/null || true
+        restorecon -RF "${SLUMBER_CONF_DIR}" 2>/dev/null || true
     fi
 }
 
@@ -585,7 +644,7 @@ verify_status() {
     echo "  • Lid Switch Action:       ${lid_switch}"
     echo "  • Suspend Button Action:   $(systemctl show systemd-suspend.service -p ExecStart --value | grep -oE 'systemd-sleep [a-z-]+' | cut -d' ' -f2)"
 
-    if [ -f "/etc/kernel/cmdline" ] && grep -qs "resume=" "/etc/kernel/cmdline"; then
+    if [ -f "${KERNEL_CMDLINE}" ] && grep -qs "resume=" "${KERNEL_CMDLINE}"; then
         echo "  • Bootloader Resume Args:  Configured (UUID & offset set)"
     fi
 
@@ -617,18 +676,18 @@ verify_status() {
     if [ "${INSTALL_USB_GUARD}" = true ]; then
         echo "  7. USB devices and docks can't wake the machine; use the built-in keyboard, trackpad, power button or lid."
     fi
-    echo "  7. Lenovo tip: disable 'Always On USB' in BIOS to cut residual drain while hibernated."
-    echo "  8. To test immediately, run:"
+    echo "  8. Lenovo tip: disable 'Always On USB' in BIOS to cut residual drain while hibernated."
+    echo "  9. To test immediately, run:"
     echo "       systemctl suspend-then-hibernate"
     echo ""
 }
 
-main() {
+cmd_enable() {
     echo "=========================================================="
-    echo "  Fedora 44 Windows-Level Auto-Hibernation Setup Script   "
+    echo "  Slumber: Windows-Level Auto-Hibernation Setup           "
     echo "=========================================================="
-    parse_args "$@"
-    check_root
+    parse_enable_args "$@"
+    check_root enable "$@"
     check_os_and_desktop
     compute_swap_size
     check_prerequisites
@@ -636,8 +695,246 @@ main() {
     create_btrfs_swapfile
     configure_kernel_and_dracut
     configure_systemd
-    install_extras
+    write_slumber_conf
+    apply_helpers
     verify_status
+}
+
+# ------------------------------------------------------------------------------
+# disable
+# ------------------------------------------------------------------------------
+
+# Trap unexpected errors and print clear diagnostic location
+on_error() {
+    local exit_code=$1
+    local line_no=$2
+    echo ""
+    log_error "================================================================="
+    log_error "Rollback halted unexpectedly with exit code ${exit_code} at line ${line_no}."
+    log_error "The bootloader cleanup was prioritized first to prevent unbootable"
+    log_error "or hanging states. Please inspect the message above."
+    log_error "================================================================="
+}
+
+revert_kernel_and_dracut() {
+    log_info "Step 1: Removing resume arguments from bootloader and Dracut..."
+
+    # 1. Remove resume parameters from all BLS entries via grubby
+    if command -v grubby &>/dev/null; then
+        log_info "Removing 'resume' and 'resume_offset' kernel args via grubby..."
+        grubby --update-kernel=ALL --remove-args="resume resume_offset" 2>/dev/null || true
+        log_success "Kernel BLS entries cleaned."
+    fi
+
+    # 2. Targeted surgical removal of resume args from /etc/default/grub (preserves unrelated edits)
+    if [ -f "${GRUB_DEFAULT}" ]; then
+        log_info "Performing targeted removal of resume parameters from ${GRUB_DEFAULT}..."
+        strip_resume_args "${GRUB_DEFAULT}"
+
+        # Verify targeted removal succeeded
+        if grep -qs "resume=" "${GRUB_DEFAULT}"; then
+            log_warn "Targeted removal incomplete; falling back to pristine backup..."
+            if [ -f "${GRUB_DEFAULT}.bak" ]; then
+                cp -a "${GRUB_DEFAULT}.bak" "${GRUB_DEFAULT}"
+                log_success "Restored ${GRUB_DEFAULT} from backup fallback."
+            else
+                log_error "Warning: 'resume=' still detected in ${GRUB_DEFAULT} and no backup file found."
+            fi
+        else
+            log_success "${GRUB_DEFAULT} cleaned; all unrelated user settings preserved."
+            rm -f "${GRUB_DEFAULT}.bak" 2>/dev/null || true
+        fi
+    fi
+
+    # 3. Targeted surgical removal of resume args from /etc/kernel/cmdline (preserves unrelated edits)
+    if [ -f "${KERNEL_CMDLINE}" ]; then
+        log_info "Performing targeted removal of resume parameters from ${KERNEL_CMDLINE}..."
+        strip_resume_args "${KERNEL_CMDLINE}"
+
+        # Verify targeted removal succeeded
+        if grep -qs "resume=" "${KERNEL_CMDLINE}"; then
+            log_warn "Targeted removal incomplete; falling back to pristine backup..."
+            if [ -f "${KERNEL_CMDLINE}.bak" ]; then
+                cp -a "${KERNEL_CMDLINE}.bak" "${KERNEL_CMDLINE}"
+                log_success "Restored ${KERNEL_CMDLINE} from backup fallback."
+            else
+                log_error "Warning: 'resume=' still detected in ${KERNEL_CMDLINE} and no backup file found."
+            fi
+        else
+            log_success "${KERNEL_CMDLINE} cleaned; all unrelated kernel parameters preserved."
+            rm -f "${KERNEL_CMDLINE}.bak" 2>/dev/null || true
+        fi
+    fi
+
+    # 4. Remove Dracut resume configuration and rebuild initramfs
+    if [ -f "${DRACUT_CONF}" ]; then
+        log_info "Removing ${DRACUT_CONF}..."
+        rm -f "${DRACUT_CONF}"
+    fi
+
+    local current_kernel
+    current_kernel=$(uname -r)
+    log_info "Rebuilding initramfs for kernel ${current_kernel} (removing resume module)..."
+    dracut -f --kver "${current_kernel}"
+    log_success "Initramfs rebuilt cleanly."
+}
+
+revert_systemd_config() {
+    log_info "Step 2: Removing systemd Suspend-then-Hibernate drop-in policies..."
+
+    rm -f "${SLEEP_CONF}" "${LOGIND_CONF}" "${SUSPEND_OVERRIDE}"
+
+    # Clean up directories if empty
+    rmdir "${SLEEP_CONF_DIR}" 2>/dev/null || true
+    rmdir "${LOGIND_CONF_DIR}" 2>/dev/null || true
+    rmdir "${SUSPEND_OVERRIDE_DIR}" 2>/dev/null || true
+
+    log_info "Reloading systemd manager and signaling logind via SIGHUP..."
+    systemctl daemon-reload
+    systemctl kill --signal=HUP systemd-logind.service 2>/dev/null || true
+    log_success "Systemd policies removed and logind reloaded cleanly."
+}
+
+disable_helpers() {
+    log_info "Step 3: Disabling lock-sleep, sleep battery report and usb-wake-guard..."
+
+    # The program and unit files belong to the package; only turn them off.
+    set_user_service lock-sleep false
+    set_user_service sleep-notify false
+    user_systemctl daemon-reload
+
+    # Stopping usb-wake-guard restores any USB wakeup settings it changed.
+    systemctl stop usb-wake-guard.service 2>/dev/null || true
+    systemctl disable usb-wake-guard.service 2>/dev/null || true
+    rm -f /run/usb-wake-guard.state
+    systemctl daemon-reload
+
+    rm -f "${SLEEP_LOG}" "${SLEEP_STATE}"
+    rm -f "${SLUMBER_CONF}"
+    rmdir "${SLUMBER_CONF_DIR}" 2>/dev/null || true
+
+    # Per-user notification bookmark
+    local user
+    user=$(invoking_user)
+    if [ -n "${user}" ] && [ "${user}" != "root" ]; then
+        rm -f "$(getent passwd "${user}" | cut -d: -f6)/.local/state/sleep-notify.last"
+    fi
+    log_success "Helper services disabled, sleep log and Slumber config removed."
+}
+
+remove_swapfile_and_subvolume() {
+    log_info "Step 4: Deactivating and removing swapfile and subvolume..."
+
+    # 1. Deactivate swap if active
+    if [ -f "${SWAP_FILE}" ] && swapon --show | grep -qs "${SWAP_FILE}"; then
+        log_info "Deactivating swap on ${SWAP_FILE}..."
+        swapoff "${SWAP_FILE}"
+        log_success "Swap deactivated."
+    fi
+
+    # 2. Invalidate swap and hibernation headers (security & hygiene)
+    # Zeroing the first 64KB destroys any hibernation signature or swap metadata
+    if [ -f "${SWAP_FILE}" ] && [ ! -L "${SWAP_FILE}" ]; then
+        log_info "Zeroing swap header to prevent stale hibernation resume..."
+        dd if=/dev/zero of="${SWAP_FILE}" bs=4096 count=16 conv=notrunc status=none 2>/dev/null || true
+        log_success "Swap header invalidated."
+    fi
+
+    # 3. Clean /etc/fstab safely with fixed string filtering
+    if [ -f "${FSTAB}" ] && grep -qs "${SWAP_FILE}" "${FSTAB}"; then
+        log_info "Removing ${SWAP_FILE} entry from ${FSTAB}..."
+        if [ ! -f "${FSTAB}.bak" ]; then
+            cp -a "${FSTAB}" "${FSTAB}.bak"
+        fi
+        grep -vF "${SWAP_FILE}" "${FSTAB}" > "${FSTAB}.tmp"
+        chmod 0644 "${FSTAB}.tmp"
+        mv "${FSTAB}.tmp" "${FSTAB}"
+        log_success "${FSTAB} updated safely."
+    fi
+
+    # 4. Remove swapfile (verify regular file, not symlink)
+    if [ -f "${SWAP_FILE}" ] && [ ! -L "${SWAP_FILE}" ]; then
+        log_info "Deleting ${SWAP_FILE}..."
+        rm -f "${SWAP_FILE}"
+        log_success "Swapfile deleted (disk space reclaimed)."
+    fi
+
+    # 5. Delete Btrfs subvolume safely (no blind rm -rf)
+    if [ -d "${SWAP_DIR}" ]; then
+        if btrfs subvolume show "${SWAP_DIR}" &>/dev/null; then
+            log_info "Deleting Btrfs subvolume '${SWAP_DIR}'..."
+            btrfs subvolume delete "${SWAP_DIR}"
+            log_success "Subvolume '${SWAP_DIR}' deleted."
+        else
+            log_info "Removing directory '${SWAP_DIR}'..."
+            rmdir "${SWAP_DIR}"
+            log_success "Directory '${SWAP_DIR}' removed."
+        fi
+    fi
+
+    # Clean up SELinux file context definition for SWAP_DIR
+    if command -v semanage &>/dev/null; then
+        semanage fcontext -d "${SWAP_DIR}(/.*)?" 2>/dev/null || true
+    fi
+}
+
+restore_selinux_and_verify() {
+    log_info "Step 5: Restoring SELinux contexts and verifying system status..."
+
+    if command -v restorecon &>/dev/null; then
+        restorecon -RF "${SLEEP_CONF_DIR}" "${LOGIND_CONF_DIR}" "/etc/dracut.conf.d" 2>/dev/null || true
+        log_success "SELinux contexts updated."
+    fi
+
+    echo ""
+    log_info "=== Post-Rollback Diagnostics ==="
+
+    # Verify zram status
+    echo "  • Active Swap Devices:"
+    swapon --show
+
+    if swapon --show | grep -qs "zram"; then
+        log_success "Default zram swap is active and healthy."
+    else
+        log_warn "zram swap device was not detected in swapon --show. Check zram-generator status if needed."
+    fi
+
+    echo -n "  • Can Hibernate: "
+    busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate 2>/dev/null || echo "Unknown"
+
+    echo -n "  • Can Suspend-Then-Hibernate: "
+    busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanSuspendThenHibernate 2>/dev/null || echo "Unknown"
+
+    echo ""
+    log_success "Rollback successfully completed! System is restored to default state."
+    echo ""
+}
+
+cmd_disable() {
+    echo "=========================================================="
+    echo "  Slumber: Reverting Suspend-then-Hibernate Setup         "
+    echo "=========================================================="
+    check_root disable
+    trap 'on_error $? $LINENO' ERR
+    revert_kernel_and_dracut
+    revert_systemd_config
+    disable_helpers
+    remove_swapfile_and_subvolume
+    restore_selinux_and_verify
+}
+
+# ------------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "${cmd}" in
+        enable)   cmd_enable "$@" ;;
+        disable)  cmd_disable "$@" ;;
+        status)   exec "$(dirname "$(readlink -f "$0")")/slumber-status" "$@" ;;
+        -h|--help|help|"") usage ;;
+        *)        log_error "Unknown command '${cmd}'."; usage; exit 2 ;;
+    esac
 }
 
 main "$@"
